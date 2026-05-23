@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data files
+amazon_data/
+amazon_data.zip
+datasets/*.jsonl
+datasets/*.jsonl.gz
+datasets/hf_cache/
+failed_image_links.jsonl
+
+# Computed outputs / embeddings
+outputs/
+out/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.idea/
+.vscode/
+
+# Locks (large)
+gr_example/uv.lock
+
+# Submodule repos (managed separately)
+RQ-VAE-Recommender/
+GRID/
