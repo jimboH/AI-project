@@ -11,8 +11,19 @@ Dataset splits follow the leave-one-out protocol (see data/amazon2023.py):
   - Valid : history = [i_1,...,i_{n-2}], target = i_{n-1}
   - Test  : history = [i_1,...,i_{n-1}], target = i_n
 
-Validation (hit@k, NDCG@k) is only performed when modality == "text",
-as required by the 3×3 training-and-testing grid.
+Validation (hit@k, NDCG@k, eval_loss) runs every eval_every steps for all
+modalities (text, image, multimodal).  The best checkpoint is saved whenever
+hit@1 improves.
+
+Training quality monitoring
+---------------------------
+Two output files are written to the checkpoint directory:
+- train.log     : human-readable log; training loss every log_every steps,
+                  validation results every eval_every steps.
+- metrics.jsonl : machine-readable JSON lines emitted every eval_every steps,
+                  containing eval_loss, hit@k, and ndcg@k.
+
+The best checkpoint is saved whenever NDCG@10 (valid) improves.
 
 Usage
 -----
@@ -24,6 +35,7 @@ Usage
 
 import gin
 import json
+import logging
 import os
 import torch
 import wandb
@@ -38,7 +50,7 @@ from data.amazon2023 import (
     METADATA_FILES,
 )
 from data.utils import batch_to, cycle, next_batch
-from evaluate.metrics import TopKAccumulator
+from evaluate.metrics import TopKAccumulator, NDCGAccumulator
 from modules.model import QwenRetrievalModel
 from modules.scheduler.inv_sqrt import InverseSquareRootScheduler
 from modules.tokenizer.semids import SemanticIdTokenizer
@@ -50,6 +62,19 @@ from pathlib import Path
 
 EMBEDDING_BASE = Path("/work/u1304848/AI/project/outputs/embeddings")
 HF_CACHE = str(Path("/work/u1304848/AI/project/datasets/hf_cache"))
+
+
+def setup_logger(log_path: str) -> logging.Logger:
+    logger = logging.getLogger("decoder_train")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
 
 
 def load_embeddings(category: str, modality: str) -> torch.Tensor:
@@ -102,16 +127,17 @@ def train(
     warmup_steps: int = 10000,
     # Checkpointing
     save_dir_root: str = "out/decoder/",
+    run_name: str = None,
     pretrained_decoder_path: str = None,
-    save_model_every: int = 100000,
-    partial_eval_every: int = 1000,
-    full_eval_every: int = 10000,
+    save_model_every: int = 2000,
+    eval_every: int = 2000,
     top_k_eval_list=(1, 5, 10),
     # Accelerate
     split_batches: bool = True,
     amp: bool = False,
     mixed_precision_type: str = "fp16",
     # Logging
+    log_every: int = 100,
     wandb_logging: bool = False,
     force_seq_reload: bool = False,
 ):
@@ -121,8 +147,8 @@ def train(
     vae_hidden_dims = list(vae_hidden_dims)
     top_k_eval_list = list(top_k_eval_list)
 
-    # Validation only runs for the text modality (text-train / text-test grid cell)
-    should_validate = modality == "text"
+    # Validation runs for all modalities
+    should_validate = True
 
     accelerator = Accelerator(
         split_batches=split_batches,
@@ -158,21 +184,16 @@ def train(
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     train_dataloader = cycle(train_dataloader)
 
-    # Validation dataset and dataloader — only needed for the text modality
-    if should_validate:
-        eval_dataset = SequentialRecommendationDataset(
-            embeddings=all_embeddings,
-            split_data=seq_splits["valid"],
-            max_seq_len=max_seq_len,
-            subsample=False,
-        )
-        eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
-        train_dataloader, eval_dataloader = accelerator.prepare(
-            train_dataloader, eval_dataloader
-        )
-    else:
-        train_dataloader = accelerator.prepare(train_dataloader)
-        eval_dataloader = None
+    eval_dataset = SequentialRecommendationDataset(
+        embeddings=all_embeddings,
+        split_data=seq_splits["valid"],
+        max_seq_len=max_seq_len,
+        subsample=False,
+    )
+    eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
+    train_dataloader, eval_dataloader = accelerator.prepare(
+        train_dataloader, eval_dataloader
+    )
 
     # Item dataset for corpus ID precomputation
     item_dataset = ItemEmbeddingDataset(all_embeddings, split="all")
@@ -227,18 +248,32 @@ def train(
     model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
 
     metrics_accumulator = TopKAccumulator(ks=top_k_eval_list)
+    ndcg_accumulator = NDCGAccumulator(ks=top_k_eval_list)
     num_params = sum(p.numel() for p in model.parameters())
     if accelerator.is_main_process:
         print(f"Device: {device}, Num parameters: {num_params:,}")
 
-    best_eval_loss = float("inf")
-    last_eval_loss = float("inf")
+    best_ndcg10 = -1.0
 
     if wandb_logging and accelerator.is_main_process:
         wandb.login()
         wandb.init(project="gen-retrieval-decoder-training", config=params)
 
-    save_dir = os.path.join(save_dir_root, f"{category}/{modality}/")
+    dir_name = run_name if run_name else modality
+    save_dir = os.path.join(save_dir_root, f"{category}/{dir_name}/")
+
+    if accelerator.is_main_process:
+        os.makedirs(save_dir, exist_ok=True)
+        logger = setup_logger(os.path.join(save_dir, "train.log"))
+        metrics_path = os.path.join(save_dir, "metrics.jsonl")
+        logger.info(
+            "Starting training — category=%s  modality=%s  iterations=%d  "
+            "n_train=%d  n_val=%d",
+            category, modality, iterations, len(train_dataset), len(eval_dataset),
+        )
+    else:
+        logger = None
+        metrics_path = None
 
     with tqdm(
         initial=start_iter,
@@ -277,30 +312,22 @@ def train(
 
             accelerator.wait_for_everyone()
 
-            # Partial eval (loss only) — text modality only
-            if should_validate and (iter + 1) % partial_eval_every == 0:
+            # Log training loss every log_every steps
+            if accelerator.is_main_process and (iter + 1) % log_every == 0:
+                logger.info(
+                    "iter=%d  train_loss=%.4f  lr=%.2e",
+                    iter + 1, total_loss, optimizer.param_groups[0]["lr"],
+                )
+
+            # Validation every eval_every steps — all modalities
+            if should_validate and (iter + 1) % eval_every == 0:
                 model.eval()
                 eval_loss = 0.0
-                n_eval_batches = 0
-                for batch in eval_dataloader:
-                    data = batch_to(batch, device)
-                    tokenized_data = tokenizer(data)
-                    with torch.no_grad():
-                        eval_loss += model(tokenized_data).loss.item()
-                    n_eval_batches += 1
+                n_eval = 0
 
-                if n_eval_batches > 0:
-                    eval_loss /= n_eval_batches
-                last_eval_loss = eval_loss
-                if wandb_logging and accelerator.is_main_process:
-                    wandb.log({"eval_loss": eval_loss, "iter": iter})
-
-            # Full eval (hit@k, NDCG@k) — text modality only
-            if should_validate and (iter + 1) % full_eval_every == 0:
-                model.eval()
                 with tqdm(
                     eval_dataloader,
-                    desc=f"Full Eval {iter + 1}",
+                    desc=f"Eval {iter + 1}",
                     disable=not accelerator.is_main_process,
                 ) as pbar_eval:
                     for batch in pbar_eval:
@@ -308,6 +335,10 @@ def train(
                         tokenized_data = tokenizer(data)
 
                         with torch.no_grad():
+                            model_out = model(tokenized_data)
+                            eval_loss += model_out.loss.item()
+                            n_eval += 1
+
                             generated = model.generate_next_sem_id(
                                 tokenized_data, top_k=True, temperature=1
                             )
@@ -316,13 +347,54 @@ def train(
                         metrics_accumulator.accumulate(
                             actual=actual, top_k=generated.sem_ids
                         )
+                        ndcg_accumulator.accumulate(
+                            actual=actual, top_k=generated.sem_ids
+                        )
 
-                eval_metrics = metrics_accumulator.reduce()
-                if accelerator.is_main_process:
-                    print(f"[iter {iter+1}] {eval_metrics}")
-                if accelerator.is_main_process and wandb_logging:
-                    wandb.log(eval_metrics)
+                eval_loss = eval_loss / n_eval if n_eval > 0 else float("inf")
+                eval_metrics = {
+                    **metrics_accumulator.reduce(),
+                    **ndcg_accumulator.reduce(),
+                }
                 metrics_accumulator.reset()
+                ndcg_accumulator.reset()
+
+                ndcg10 = float(eval_metrics.get("ndcg@10", 0.0))
+
+                if accelerator.is_main_process:
+                    metrics_str = "  ".join(
+                        f"{k}={v:.4f}" for k, v in sorted(eval_metrics.items())
+                    )
+                    logger.info(
+                        "iter=%d  [eval]  loss=%.4f  %s",
+                        iter + 1, eval_loss, metrics_str,
+                    )
+
+                    record = {
+                        "iter": iter + 1,
+                        "eval_loss": float(eval_loss),
+                        **{k: float(v) for k, v in eval_metrics.items()},
+                    }
+                    with open(metrics_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                    if ndcg10 > best_ndcg10:
+                        best_ndcg10 = ndcg10
+                        state = {
+                            "iter": iter,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": lr_scheduler.state_dict(),
+                            "category": category,
+                            "modality": modality,
+                        }
+                        torch.save(state, os.path.join(save_dir, "checkpoint_best.pt"))
+                        logger.info(
+                            "iter=%d  [new best]  ndcg@10=%.4f", iter + 1, ndcg10
+                        )
+
+                    if wandb_logging:
+                        wandb.log({"eval_loss": eval_loss, "iter": iter, **eval_metrics})
 
             if accelerator.is_main_process:
                 state = {
@@ -337,13 +409,6 @@ def train(
 
                 if (iter + 1) % save_model_every == 0 or iter + 1 == iterations:
                     torch.save(state, os.path.join(save_dir, f"checkpoint_{iter}.pt"))
-                    if iter + 1 == iterations:
-                        torch.save(state, os.path.join(save_dir, "checkpoint_best.pt"))
-
-                # Track best model by eval loss (text modality only)
-                if should_validate and last_eval_loss < best_eval_loss:
-                    best_eval_loss = last_eval_loss
-                    torch.save(state, os.path.join(save_dir, "checkpoint_best.pt"))
 
                 if wandb_logging:
                     wandb.log(

@@ -236,11 +236,18 @@ class QwenRetrievalModel(nn.Module):
 
         total_loss = torch.tensor(0.0, device=last_hidden.device)
         loss_d = []
+        cond_hidden = last_hidden
         for h in range(self.num_hierarchies):
-            logits = self.output_mlp[h](last_hidden)  # (B, num_embeddings_per_hierarchy)
+            logits = self.output_mlp[h](cond_hidden)  # (B, num_embeddings_per_hierarchy)
             h_loss = F.cross_entropy(logits, fut_ids[:, h].long())
             total_loss = total_loss + h_loss
             loss_d.append(h_loss.detach())
+            # Teacher forcing: condition next head on ground-truth code at layer h
+            if h < self.num_hierarchies - 1:
+                gt_emb = self.item_embedding(
+                    fut_ids[:, h].long() + h * self.num_embeddings_per_hierarchy
+                )  # (B, D)
+                cond_hidden = cond_hidden + gt_emb
 
         return ModelOutput(loss=total_loss, logits=None, loss_d=torch.stack(loss_d))
 
@@ -260,14 +267,13 @@ class QwenRetrievalModel(nn.Module):
 
         generated = None
         log_probas = None
+        cond_hidden = last_hidden  # tracks conditioning state across hierarchy levels
 
         for h in range(self.num_hierarchies):
             if h == 0:
-                probas = F.softmax(self.output_mlp[h](last_hidden), dim=-1)  # (B, E)
-                samples = torch.multinomial(probas, num_samples=n_cands)  # (B, n_cands)
-                samp_log_p = torch.log(
-                    torch.gather(probas, 1, samples) + 1e-12
-                )  # (B, n_cands)
+                probas = F.softmax(self.output_mlp[h](cond_hidden), dim=-1)  # (B, E)
+                top_probs, samples = torch.topk(probas, n_cands, dim=-1)  # (B, n_cands)
+                samp_log_p = torch.log(top_probs + 1e-12)
 
                 is_valid = self._check_valid_prefix(
                     samples.reshape(-1, 1)
@@ -279,16 +285,20 @@ class QwenRetrievalModel(nn.Module):
                 generated = torch.gather(samples, 1, top_k_idx).unsqueeze(-1)  # (B, k, 1)
                 log_probas = scores[:, :k]  # (B, k)
 
-                # Expand last_hidden once for all k beams; same encoding for every beam
+                # Expand last_hidden for all k beams
                 last_hidden = last_hidden.repeat_interleave(k, dim=0)  # (B*k, D)
+
+                # Condition on selected level-0 codes for next layer
+                beam_codes = generated.reshape(B * k)  # (B*k,)
+                cond_hidden = last_hidden + self.item_embedding(
+                    beam_codes + 0 * self.num_embeddings_per_hierarchy
+                )  # (B*k, D)
             else:
                 probas = F.softmax(
-                    self.output_mlp[h](last_hidden), dim=-1
+                    self.output_mlp[h](cond_hidden), dim=-1
                 )  # (B*k, E)
-                samples = torch.multinomial(
-                    probas, num_samples=n_cands
-                )  # (B*k, n_cands)
-                samp_log_p = torch.log(torch.gather(probas, 1, samples) + 1e-12)
+                top_probs, samples = torch.topk(probas, n_cands, dim=-1)  # (B*k, n_cands)
+                samp_log_p = torch.log(top_probs + 1e-12)
 
                 prev = generated.reshape(B * k, h)
                 prefix = torch.cat(
@@ -317,6 +327,18 @@ class QwenRetrievalModel(nn.Module):
                 ).unsqueeze(-1)
                 generated = torch.cat([parent_ids, new_ids], dim=-1)
                 log_probas = scores[:, :k]
+
+                # Update conditioning for next layer
+                if h < self.num_hierarchies - 1:
+                    parent_flat = (
+                        parent_beam_idx
+                        + torch.arange(B, device=parent_beam_idx.device).unsqueeze(1) * k
+                    ).reshape(B * k)
+                    cond_hidden = cond_hidden[parent_flat]  # re-order by selected parents
+                    new_beam_codes = new_ids.reshape(B * k)
+                    cond_hidden = cond_hidden + self.item_embedding(
+                        new_beam_codes + h * self.num_embeddings_per_hierarchy
+                    )
 
         return generated, log_probas
 

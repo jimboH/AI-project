@@ -3,7 +3,7 @@ import modules.quantize
 train.category = "All_Beauty"
 train.modality = "text"
 
-train.iterations = 200000
+train.iterations = 30000
 train.batch_size = 640
 train.learning_rate = 0.001
 train.weight_decay = 0.0001

@@ -21,6 +21,15 @@ train.vae_codebook_mode = %modules.quantize.QuantizeForwardMode.STE
 train.commitment_weight = 0.25
 train.use_kmeans_init = True
 
+# EMA codebook updates with dead-entry reseeding (prevents codebook collapse)
+train.vae_use_ema = True
+train.vae_ema_decay = 0.99
+train.vae_ema_threshold = 1.0
+
+# L2-normalise both encoder outputs and codebook entries before distance
+# calculation so that nearest-neighbour lookup is purely directional.
+train.vae_distance_l2_normalize = True
+
 train.save_dir_root = "out/rqvae/"
 train.save_model_every = 10000
 train.eval_every = 10000

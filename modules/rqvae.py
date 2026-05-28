@@ -114,7 +114,10 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
 
     def load_pretrained(self, path: str) -> None:
         state = torch.load(path, map_location=self.device, weights_only=False)
-        self.load_state_dict(state["model"])
+        # EMA buffers (ema_cluster_size, ema_embed_sum) are only used during
+        # training; ignore them if the checkpoint has them but this instance
+        # was created without use_ema=True.
+        self.load_state_dict(state["model"], strict=False)
         print(f"---Loaded RQVAE Iter {state['iter']}---")
 
     def encode(self, x: Tensor) -> Tensor:

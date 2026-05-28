@@ -5,7 +5,7 @@ train.iterations = 100000
 train.batch_size = 64
 train.learning_rate = 0.001
 train.weight_decay = 0.0001
-train.train_data_subsample = True
+train.train_data_subsample = False
 
 # Must match the trained RQ-VAE checkpoint
 # Qwen3-VL-Embedding-2B hidden size = 1536
@@ -22,13 +22,13 @@ train.pretrained_rqvae_path = "out/rqvae/Musical_Instruments/multimodal/checkpoi
 # Qwen/Qwen3.5-0.8B
 train.qwen_model_name = "Qwen/Qwen3.5-0.8B"
 train.freeze_encoder = False
-train.top_k_for_generation = 10
+train.top_k_for_generation = 20
 train.should_add_sep_token = True
 
 train.save_dir_root = "out/decoder/"
-train.save_model_every = 100000
-train.partial_eval_every = 1000
-train.full_eval_every = 10000
+train.save_model_every = 2000
+train.eval_every = 2000
+train.log_every = 100
 train.top_k_eval_list = [1, 5, 10]
 train.wandb_logging = False
 train.amp = False

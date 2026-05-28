@@ -201,12 +201,12 @@ def load_sequential_data(
         valid_data["history"].append(full_seq[:-2])
         valid_data["target"].append(full_seq[-2])
 
-        # Train: predict the last item of the remaining training prefix.
-        # Remaining prefix = [i_1,...,i_{n-2}]; history = [i_1,...,i_{n-3}], target = i_{n-2}.
-        if n >= 4:
+        # Train: all valid subsequences (history=[i_1,...,i_{k-1}], target=i_k)
+        # for k in {2,...,n-2}, preserving valid and test as leave-one-out.
+        for k in range(2, n - 1):
             train_data["user_ids"].append(uid)
-            train_data["history"].append(full_seq[:-3])   # [i_1, ..., i_{n-3}]
-            train_data["target"].append(full_seq[-3])     # i_{n-2}
+            train_data["history"].append(full_seq[:k - 1])   # [i_1, ..., i_{k-1}]
+            train_data["target"].append(full_seq[k - 1])     # i_k
     return {"train": train_data, "valid": valid_data, "test": test_data}
 
 

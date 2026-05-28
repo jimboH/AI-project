@@ -36,7 +36,6 @@ The script expects checkpoint files at:
 import argparse
 import json
 import os
-import ipdb
 from itertools import product
 from pathlib import Path
 from typing import Dict, Optional
@@ -60,7 +59,7 @@ HF_CACHE = str(Path("/work/u1304848/AI/project/datasets/hf_cache"))
 
 MODALITIES = ["text", "image", "multimodal"]
 TOP_K_LIST = [1, 5, 10]
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 MAX_SEQ_LEN = 20
 
 
@@ -121,6 +120,11 @@ def evaluate_cell(
     rqvae_dir: Path,
     decoder_dir: Path,
     device: str,
+    qwen_model_name: str = "Qwen/Qwen3.5-0.8B",
+    freeze_encoder: bool = False,
+    top_k_for_generation: int = 20,
+    should_add_sep_token: bool = True,
+    num_user_bins: int = None,
 ) -> Dict[str, float]:
     """Evaluate one (train_mod, test_mod) cell."""
     print(
@@ -149,7 +153,8 @@ def evaluate_cell(
     vae_n_cat_feats = model_cfg.get("n_cat_features", 0)
 
     # Build tokenizer with the train-modality RQ-VAE weights
-    rqvae_path = _find_latest_checkpoint(rqvae_ckpt_dir) or (rqvae_ckpt_dir / "checkpoint_best.pt")
+    _best = rqvae_ckpt_dir / "checkpoint_best.pt"
+    rqvae_path = _best if _best.exists() else _find_latest_checkpoint(rqvae_ckpt_dir)
 
     tokenizer = SemanticIdTokenizer(
         input_dim=vae_input_dim,
@@ -211,6 +216,11 @@ def evaluate_cell(
         codebooks=codebooks,
         num_hierarchies=vae_n_layers,
         num_embeddings_per_hierarchy=vae_codebook_size,
+        qwen_model_name=qwen_model_name,
+        freeze_encoder=freeze_encoder,
+        top_k_for_generation=top_k_for_generation,
+        should_add_sep_token=should_add_sep_token,
+        num_user_bins=num_user_bins,
     )
     model.load_state_dict(decoder_state["model"])
     model.eval()
@@ -230,7 +240,6 @@ def evaluate_cell(
                 )
 
             actual = tokenized_data.sem_ids_fut[:, :vae_n_layers]
-            ipdb.set_trace()
             topk_acc.accumulate(actual=actual, top_k=generated.sem_ids)
             ndcg_acc.accumulate(actual=actual, top_k=generated.sem_ids)
 
@@ -250,6 +259,11 @@ def run_grid(
     output_dir: Path,
     device: str,
     modalities: list = None,
+    qwen_model_name: str = "Qwen/Qwen3.5-0.8B",
+    freeze_encoder: bool = False,
+    top_k_for_generation: int = 20,
+    should_add_sep_token: bool = True,
+    num_user_bins: int = None,
 ) -> dict:
     grid_results = {}
     mods = modalities if modalities is not None else MODALITIES
@@ -274,6 +288,11 @@ def run_grid(
                 rqvae_dir=rqvae_dir,
                 decoder_dir=decoder_dir,
                 device=device,
+                qwen_model_name=qwen_model_name,
+                freeze_encoder=freeze_encoder,
+                top_k_for_generation=top_k_for_generation,
+                should_add_sep_token=should_add_sep_token,
+                num_user_bins=num_user_bins,
             )
             grid_results[cell_key] = metrics
         except Exception as e:
@@ -355,6 +374,36 @@ def main():
         choices=MODALITIES,
         help="Restrict evaluation to specific modalities.",
     )
+    parser.add_argument(
+        "--qwen_model_name",
+        type=str,
+        default="Qwen/Qwen3.5-0.8B",
+        help="HuggingFace model name for the Qwen backbone (must match training).",
+    )
+    parser.add_argument(
+        "--freeze_encoder",
+        action="store_true",
+        default=False,
+        help="Whether the Qwen encoder was frozen during training.",
+    )
+    parser.add_argument(
+        "--top_k_for_generation",
+        type=int,
+        default=20,
+        help="Number of top-k candidates to return during beam search (must match training).",
+    )
+    parser.add_argument(
+        "--should_add_sep_token",
+        action="store_true",
+        default=True,
+        help="Disable the separator token between items (pass if training used should_add_sep_token=False).",
+    )
+    parser.add_argument(
+        "--num_user_bins",
+        type=int,
+        default=None,
+        help="Number of user embedding bins (must match training; omit if not used).",
+    )
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -375,6 +424,11 @@ def main():
         output_dir=output_dir,
         device=device,
         modalities=modalities_to_use,
+        qwen_model_name=args.qwen_model_name,
+        freeze_encoder=args.freeze_encoder,
+        top_k_for_generation=args.top_k_for_generation,
+        should_add_sep_token=args.should_add_sep_token,
+        num_user_bins=args.num_user_bins,
     )
 
     # Save results

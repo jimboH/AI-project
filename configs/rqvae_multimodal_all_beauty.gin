@@ -3,7 +3,7 @@ import modules.quantize
 train.category = "All_Beauty"
 train.modality = "multimodal"
 
-train.iterations = 200000
+train.iterations = 30000
 train.batch_size = 640
 train.learning_rate = 0.001
 train.weight_decay = 0.0001
@@ -20,6 +20,15 @@ train.vae_sim_vq = False
 train.vae_codebook_mode = %modules.quantize.QuantizeForwardMode.STE
 train.commitment_weight = 0.25
 train.use_kmeans_init = True
+
+# EMA codebook updates with dead-entry reseeding (prevents codebook collapse)
+train.vae_use_ema = True
+train.vae_ema_decay = 0.99
+train.vae_ema_threshold = 1.0
+
+# L2-normalise both encoder outputs and codebook entries before distance
+# calculation so that nearest-neighbour lookup is purely directional.
+train.vae_distance_l2_normalize = True
 
 train.save_dir_root = "out/rqvae/"
 train.save_model_every = 10000
