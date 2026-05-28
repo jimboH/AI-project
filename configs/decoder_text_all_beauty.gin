@@ -1,12 +1,13 @@
 train.category = "All_Beauty"
 train.modality = "text"
 
-train.iterations = 25000
+train.iterations = 1500
 train.batch_size = 16
 train.gradient_accumulate_every = 4
-train.learning_rate = 0.001
-train.weight_decay = 0.0001
-train.warmup_steps = 1000
+train.learning_rate = 5e-5
+train.weight_decay = 0.1
+train.warmup_steps = 200
+train.max_grad_norm = 1.0
 train.train_data_subsample = False
 
 # Must match the trained RQ-VAE checkpoint
@@ -27,12 +28,11 @@ train.freeze_encoder = False
 train.top_k_for_generation = 20
 train.should_add_sep_token = True
 
-train.save_dir_root = "out/decoder/"
+train.save_dir_root = "/work/u1304848/AI/project/out/decoder/"
 train.run_name = "text_v1"
-train.save_model_every = 2500
-train.eval_every = 2500
+train.save_model_every = 300
+train.eval_every = 300
 train.log_every = 100
 train.top_k_eval_list = [1, 5, 10]
 train.wandb_logging = False
-train.amp = True
-train.mixed_precision_type = "bf16"
+train.amp = False

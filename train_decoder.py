@@ -194,7 +194,6 @@ def train(
     train_dataloader, eval_dataloader = accelerator.prepare(
         train_dataloader, eval_dataloader
     )
-
     # Item dataset for corpus ID precomputation
     item_dataset = ItemEmbeddingDataset(all_embeddings, split="all")
 

@@ -18,6 +18,9 @@ amazon_data.zip
 datasets/*.jsonl
 datasets/*.jsonl.gz
 datasets/hf_cache/
+datasets/images/
+datasets/images_upload_staging/
+datasets/upload_images.log
 failed_image_links.jsonl
 
 # Computed outputs / embeddings
