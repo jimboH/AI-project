@@ -210,10 +210,14 @@ def evaluate_cell(
     decoder_ckpt_dir = decoder_dir / category / train_modality
     decoder_state = _load_checkpoint(decoder_ckpt_dir)
 
-    codebooks = corpus_ids[:, :vae_n_layers].cpu()
-
+    # Cross-modal semantic IDs: test-modality embeddings encoded through the
+    # train-modality RQ-VAE. Keep a pristine copy — load_state_dict below copies
+    # the checkpoint's (train-modality) codebooks buffer *in place* via copy_(),
+    # which mutates whatever tensor object backs the buffer. Cloning here keeps
+    # corpus_ids / this copy from being clobbered.
+    cross_modal_codebooks = corpus_ids[:, :vae_n_layers].clone().cpu()
     model = QwenRetrievalModel(
-        codebooks=codebooks,
+        codebooks=cross_modal_codebooks.clone(),
         num_hierarchies=vae_n_layers,
         num_embeddings_per_hierarchy=vae_codebook_size,
         qwen_model_name=qwen_model_name,
@@ -223,6 +227,12 @@ def evaluate_cell(
         num_user_bins=num_user_bins,
     )
     model.load_state_dict(decoder_state["model"])
+    # After load_state_dict the buffer holds the checkpoint's train-modality
+    # codebooks. Restore the cross-modal IDs from the pristine copy so beam
+    # search is constrained to the same semantic-ID space as the eval targets.
+    # (Plain `model.codebooks = cross_modal_codebooks` is enough because the
+    # earlier in-place copy_ only touched the buffer's own clone, not this one.)
+    model.codebooks = cross_modal_codebooks.to(device)
     model.eval()
     model = model.to(device)
 
