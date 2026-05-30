@@ -320,6 +320,42 @@ python3 train_rqvae_multimodal.py configs/rqvae_multimodal_joint_all_beauty.gin
 - `metrics.jsonl` logs, every `eval_every`, the per-modality **unique-ID ratio** and the
   per-item **cross-modal ID agreement** — the headline numbers that quantify the fix.
 
+**Train the decoder on the shared semantic IDs**
+
+Because the shared RQ-VAE produces a **single, modality-invariant semantic-ID space**
+(the alignment loss drives `id(text_i) ≈ id(image_i) ≈ id(mm_i)`), the decoder is
+decoupled from modality at the ID level. This changes how many decoders you train
+relative to the per-modality pipeline (Step 3 above, which trains one decoder per
+modality):
+
+- **You only need ONE decoder.** This is the payoff of Design A. Train a single
+  `QwenRetrievalModel` on histories tokenized through the **shared** RQ-VAE + a modality
+  adapter, using one modality's embeddings as the tokenization source (`multimodal` is the
+  natural default — it is the richest; or pick whichever modality you serve at test time).
+  At evaluation, every test modality's embeddings are adapted into the *same* shared space,
+  so this one decoder serves all three test columns of the grid.
+
+- **Optionally, train one decoder per train-modality** *only* if you want to populate and
+  study the full 3×3 train×test transfer grid. `evaluate_grid_adapter.py` iterates
+  `product(modalities, modalities)` and loads a decoder from
+  `{decoder_dir}/{category}/{train_mod}`; the test modality is applied at eval time by
+  adapting the test embeddings into the shared space.
+
+> **Important — the stock `train_decoder.py` does not apply the adapter.** It builds its
+> tokenizer from a *per-modality* `RqVae` checkpoint (`rqvae_weights_path=...`) and feeds
+> **raw** embeddings with no adapter (`train_decoder.py:201-216`). To train on the shared
+> IDs, histories and the corpus must be tokenized through the shared RQ-VAE **plus** the
+> relevant modality adapter — exactly what `evaluate_grid_adapter.py` does via
+> `adapt_embeddings()` (raw embedding → adapter → shared space) and
+> `build_shared_tokenizer()` (a `SemanticIdTokenizer` whose `rq_vae` IS the shared one).
+> So either (a) pre-compute adapter-transformed embeddings and point a shared-RQ-VAE
+> tokenizer at them, or (b) add a thin training entry point that mirrors that logic.
+> Running `train_decoder.py` unchanged would tokenize with a per-modality RQ-VAE and no
+> adapter, producing IDs that do **not** match the shared-ID space the evaluation grid uses.
+
+After the decoder is trained on the shared IDs, evaluate it with the `--decoder_dir` flag
+of `evaluate_grid_adapter.py` (below).
+
 **Evaluate the improvement**
 
 ```bash
