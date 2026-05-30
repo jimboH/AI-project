@@ -4,10 +4,13 @@
 Usage:
     python3 upload_checkpoints_to_hf.py --repo jimboH/amazon2023-genrec
 
-This script uploads:
-    - out/rqvae/     → rqvae/       (~1.4 GB)
-    - out/decoder/   → decoder/     (~63 GB)
-    - out/grid_results/ → grid_results/
+This script uploads the following 6 checkpoint files:
+    - out/rqvae/All_Beauty/text/checkpoint_best.pt
+    - out/rqvae/All_Beauty/image/checkpoint_best.pt
+    - out/rqvae/All_Beauty/multimodal/checkpoint_best.pt
+    - out/decoder/All_Beauty/text/checkpoint_best.pt
+    - out/decoder/All_Beauty/image/checkpoint_best.pt
+    - out/decoder/All_Beauty/multimodal/checkpoint_best.pt
 
 It uses upload_large_folder which supports resumption — safe to re-run
 if interrupted.
@@ -18,6 +21,15 @@ from pathlib import Path
 import huggingface_hub
 
 OUT_DIR = Path("/work/u1304848/AI/project/out")
+
+CHECKPOINTS = [
+    "rqvae/All_Beauty/text/checkpoint_best.pt",
+    "rqvae/All_Beauty/image/checkpoint_best.pt",
+    "rqvae/All_Beauty/multimodal/checkpoint_best.pt",
+    "decoder/All_Beauty/text/checkpoint_best.pt",
+    "decoder/All_Beauty/image/checkpoint_best.pt",
+    "decoder/All_Beauty/multimodal/checkpoint_best.pt",
+]
 
 
 def main():
@@ -32,39 +44,34 @@ def main():
         default=None,
         help="HF write token (optional if already logged in via huggingface-cli login)",
     )
-    parser.add_argument(
-        "--subdir",
-        default=None,
-        choices=["rqvae", "decoder", "grid_results"],
-        help="Upload only one subdirectory (omit to upload all)",
-    )
     args = parser.parse_args()
 
     api = huggingface_hub.HfApi(token=args.token)
 
     print(f"Uploading to existing model repo: https://huggingface.co/{args.repo}")
 
-    subdirs = [args.subdir] if args.subdir else ["rqvae", "grid_results", "decoder"]
+    present = [p for p in CHECKPOINTS if (OUT_DIR / p).exists()]
+    missing = [p for p in CHECKPOINTS if not (OUT_DIR / p).exists()]
+    for p in missing:
+        print(f"  Skipping (not found): {OUT_DIR / p}")
+    if not present:
+        print("Nothing to upload.")
+        return
 
-    for subdir in subdirs:
-        src = OUT_DIR / subdir
-        if not src.exists():
-            print(f"\nSkipping {subdir}/ (not found at {src})")
-            continue
+    size_gb = sum((OUT_DIR / p).stat().st_size for p in present) / 1e9
+    print(f"\nUploading {len(present)} checkpoint(s) ({size_gb:.1f} GB)...")
+    for p in present:
+        print(f"  {p}")
+    if size_gb > 1:
+        print("Safe to interrupt and re-run; upload_large_folder resumes automatically.\n")
 
-        size_gb = sum(f.stat().st_size for f in src.rglob("*") if f.is_file()) / 1e9
-        print(f"\nUploading {subdir}/ ({size_gb:.1f} GB)...")
-        if size_gb > 1:
-            print("Safe to interrupt and re-run; upload_large_folder resumes automatically.\n")
-
-        api.upload_large_folder(
-            folder_path=str(src),
-            path_in_repo=subdir,
-            repo_id=args.repo,
-            repo_type="model",
-            num_workers=4,
-        )
-        print(f"  Done: {subdir}/")
+    api.upload_large_folder(
+        folder_path=str(OUT_DIR),
+        repo_id=args.repo,
+        repo_type="model",
+        allow_patterns=present,
+        num_workers=4,
+    )
 
     print("\nAll uploads complete.")
 

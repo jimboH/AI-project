@@ -59,6 +59,7 @@ modality is evaluated with another modality's tokenisation.
 project/
 ├── configs/                   # Gin configuration files
 │   ├── rqvae_{mod}_{cat}.gin  # RQ-VAE training configs (2 categories × 3 modalities)
+│   ├── rqvae_multimodal_joint_{cat}.gin # Shared-codebook joint RQ-VAE config (Design A)
 │   └── decoder_{mod}_{cat}.gin# Decoder training configs
 ├── data/
 │   ├── amazon2023.py          # Dataset loading, leave-one-out splits, text-prompt builder
@@ -77,6 +78,8 @@ project/
 │   └── kmeans.py              # K-means codebook initialisation
 ├── modules/
 │   ├── rqvae.py               # RQ-VAE model
+│   ├── rqvae_multimodal.py    # MultiModalRqVae — shared codebook + per-modality adapters (Design A)
+│   ├── adapter.py             # ModalityAdapter — per-modality residual input adapter
 │   ├── model.py               # QwenRetrievalModel (Qwen3.5-0.8B only)
 │   ├── quantize.py            # Quantisation layer (STE / Gumbel / Rotation)
 │   ├── encoder.py             # MLP encoder/decoder blocks
@@ -92,9 +95,11 @@ project/
 │   ├── rqvae/                 # RQ-VAE checkpoints
 │   └── decoder/               # Decoder checkpoints
 ├── precompute_embeddings.py   # Step 1 — extract and cache embeddings
-├── train_rqvae.py             # Step 2 — train RQ-VAE
+├── train_rqvae.py             # Step 2 — train RQ-VAE (per modality, default)
+├── train_rqvae_multimodal.py  # Step 2 (alt) — joint shared-codebook RQ-VAE (Design A)
 ├── train_decoder.py           # Step 3 — train sequence model
-├── evaluate_grid.py           # 3×3 cross-modal evaluation grid
+├── evaluate_grid.py           # 3×3 cross-modal evaluation grid (per-modality RQ-VAEs)
+├── evaluate_grid_adapter.py   # Design A evaluation: unique-ID ratio + agreement (+ decoder grid)
 └── requirements.txt
 ```
 
@@ -199,6 +204,15 @@ python3 train_rqvae.py configs/rqvae_multimodal_all_beauty.gin
 - Distance L2 normalisation (`vae_distance_l2_normalize = True`) for directional lookups
 - Checkpoints saved every 10 000 iterations; best by eval loss at `checkpoint_best.pt`
 
+> **Optional — joint shared-codebook RQ-VAE (cross-modal "Design A").** The commands
+> above train one *independent* RQ-VAE per modality, which causes the cross-modal
+> semantic-ID collapse analysed in `cross_modal.md` / `RQVAE_improvement.md`. To instead
+> train a **single shared codebook fed by per-modality adapters** (so the same item gets
+> the same semantic ID across modalities), use the additive entry point
+> `train_rqvae_multimodal.py` — see
+> [Cross-Modal Improvement (Design A)](#cross-modal-improvement-shared-codebook-rq-vae-with-modality-adapters-design-a)
+> below. The per-modality pipeline here is unchanged and remains the default.
+
 **Step 3 — Train sequence model**
 
 Trains one `QwenRetrievalModel` per modality on leave-one-out interaction histories:
@@ -265,6 +279,72 @@ Nine grid cells cover every combination of training modality and testing modalit
 For cross-modal cells (train ≠ test), test-modality embeddings are projected through the
 train-modality RQ-VAE to obtain semantic IDs.  If the embedding dimensions differ, test
 embeddings are zero-padded or truncated to match the RQ-VAE input dimension.
+
+---
+
+## Cross-Modal Improvement: Shared-Codebook RQ-VAE with Modality Adapters (Design A)
+
+The default pipeline trains one RQ-VAE **per modality**, so a product's text-derived and
+image-derived semantic IDs are unrelated labellings. Cross-modal evaluation then collapses
+(measured at **3.4 %** unique IDs vs **89.9 %** same-modal on `All_Beauty` — see
+`cross_modal.md`). **Design A** fixes this by training a **single shared RQ-VAE** (one
+encoder + one set of 3×256 codebooks + one decoder) fed by a small **residual adapter per
+modality**, with a **cross-modal alignment loss** that pulls the same item's per-modality
+latents to the *same* code. Full rationale and analysis: `RQVAE_improvement.md`.
+
+**This was added without modifying any existing code** — all of the following are new,
+additive files. The original `train_rqvae.py` / `evaluate_grid.py` paths are untouched and
+remain the default.
+
+| New file | Role |
+|---|---|
+| `modules/adapter.py` | `ModalityAdapter` — residual MLP, identity at init (`alpha=0`) |
+| `modules/rqvae_multimodal.py` | `MultiModalRqVae` — wraps the existing `RqVae`; shared codebook + per-modality adapters + alignment loss |
+| `train_rqvae_multimodal.py` | Joint training entry point (gin-configurable `train_multimodal`) |
+| `configs/rqvae_multimodal_joint_all_beauty.gin` | Joint-training config (EMA + L2-normalised distance, `lam_align`, warm-up) |
+| `evaluate_grid_adapter.py` | Evaluation: unique-ID-ratio / cross-modal-agreement grid (+ optional decoder hit@k grid) |
+
+**Train the shared RQ-VAE**
+
+```bash
+python3 train_rqvae_multimodal.py configs/rqvae_multimodal_joint_all_beauty.gin
+# → out/rqvae/All_Beauty/multimodal_joint/{checkpoint_*.pt, train.log, metrics.jsonl}
+```
+
+- Loads the **same item indices** across all modalities (every `*_embeddings.pt` shares the
+  `asins.json` ordering, so alignment is exact and free).
+- Loss = `recon + commitment + lam_align · (1 − cos(z_a, z_b))`, summed over modalities and
+  averaged over cross-modal pairs, with `lam_align` warmed up over `align_warmup_iters`.
+- K-means init runs on the **union** of all modalities, and EMA + dead-entry reseeding keep
+  the codebook from collapsing.
+- `metrics.jsonl` logs, every `eval_every`, the per-modality **unique-ID ratio** and the
+  per-item **cross-modal ID agreement** — the headline numbers that quantify the fix.
+
+**Evaluate the improvement**
+
+```bash
+# RQ-VAE metrics only (no decoder needed) — the Design A success metric:
+python3 evaluate_grid_adapter.py --category All_Beauty --mm_rqvae_dir out/rqvae/
+
+# also run the decoder hit@k grid (decoders must be trained on the SHARED IDs):
+python3 evaluate_grid_adapter.py --category All_Beauty \
+    --mm_rqvae_dir out/rqvae/ --decoder_dir out/decoder/
+```
+
+`evaluate_grid_adapter.py` prints, per modality, the shared-codebook unique-ID ratio and the
+cross-modal ID-agreement table. With Design A the off-diagonal unique ratio should climb from
+~3 % back toward the same-modal ~90 %, and ID agreement should rise from ~0 % toward a high
+value. The optional `--decoder_dir` grid reuses the existing `QwenRetrievalModel` decoders;
+because there is now a **single** semantic-ID space, the beam-search `codebooks` buffer and
+the eval targets share it (the same pristine-clone discipline as `evaluate_grid.py:218-235`
+is applied). For the hit@k numbers to reflect the improvement, the decoders should be
+**trained on the shared IDs** (tokenize histories through the shared codebook + adapter); the
+script prints a reminder to that effect.
+
+> **Notes.** Adapters start at identity, so k-means init sees the raw embedding distribution.
+> All Qwen3-VL embeddings are 2048-d; `vae_input_dim` is auto-corrected if a config differs.
+> `Musical_Instruments` currently lacks `multimodal_embeddings.pt`, so set
+> `train_multimodal.modalities = ["text", "image"]` for that category.
 
 ---
 

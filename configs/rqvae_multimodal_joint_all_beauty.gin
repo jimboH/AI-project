@@ -1,0 +1,48 @@
+import modules.quantize
+
+# Design A: shared-codebook RQ-VAE with per-modality adapters, trained jointly
+# across all modalities with a cross-modal alignment loss.
+# Entry point: train_rqvae_multimodal.py  (does NOT touch the per-modality path).
+
+train_multimodal.category = "All_Beauty"
+train_multimodal.modalities = ["text", "image", "multimodal"]
+
+train_multimodal.iterations = 30000
+train_multimodal.batch_size = 640
+train_multimodal.learning_rate = 0.001
+train_multimodal.weight_decay = 0.0001
+
+# Cross-modal alignment: pull same-item latents together, warmed up so the
+# codebook can organise before alignment pressure ramps in.
+train_multimodal.lam_align = 1.0
+train_multimodal.align_warmup_iters = 2000
+
+# Qwen3-VL-Embedding-2B embeddings are 2048-d (auto-detected if this differs).
+train_multimodal.vae_input_dim = 2048
+train_multimodal.vae_embed_dim = 32
+train_multimodal.vae_hidden_dims = [768, 512, 256]
+train_multimodal.vae_codebook_size = 256
+train_multimodal.vae_n_layers = 3
+train_multimodal.vae_n_cat_feats = 0
+train_multimodal.vae_codebook_normalize = False
+train_multimodal.vae_sim_vq = False
+train_multimodal.vae_codebook_mode = %modules.quantize.QuantizeForwardMode.STE
+train_multimodal.commitment_weight = 0.25
+train_multimodal.use_kmeans_init = True
+
+# EMA codebook updates with dead-entry reseeding (prevents codebook collapse).
+train_multimodal.vae_use_ema = True
+train_multimodal.vae_ema_decay = 0.99
+train_multimodal.vae_ema_threshold = 1.0
+
+# Directional (L2-normalised) nearest-neighbour lookup — matches the image config.
+train_multimodal.vae_distance_l2_normalize = True
+
+# Per-modality adapter (residual MLP, identity at init).
+train_multimodal.adapter_hidden = 1024
+train_multimodal.adapter_dropout = 0.0
+
+train_multimodal.save_dir_root = "out/rqvae/"
+train_multimodal.save_model_every = 10000
+train_multimodal.eval_every = 10000
+train_multimodal.log_every = 1000
