@@ -115,9 +115,10 @@ class SemanticIdTokenizer(nn.Module):
         return self.cached_ids
 
     def _tokenize_seq_batch_from_cached(self, ids: Tensor) -> Tensor:
+        device = ids.device
         return rearrange(
-            self.cached_ids[ids.flatten(), :], "(b n) d -> b (n d)", n=ids.shape[1]
-        )
+            self.cached_ids[ids.flatten().cpu(), :], "(b n) d -> b (n d)", n=ids.shape[1]
+        ).to(device)
 
     @torch.no_grad()
     @eval_mode

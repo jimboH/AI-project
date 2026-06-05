@@ -108,6 +108,15 @@ class QwenRetrievalModel(nn.Module):
             nn.Embedding(num_user_bins, qwen_hidden) if num_user_bins else None
         )
 
+        # Pre-compute CPU prefix sets for O(1) valid-prefix lookup (avoids
+        # large GPU broadcasts in _check_valid_prefix that cause OOM / CUDA errors).
+        self._prefix_sets: list[set] = []
+        cb_cpu = codebooks.cpu()
+        for L in range(1, num_hierarchies + 1):
+            self._prefix_sets.append(
+                set(map(tuple, cb_cpu[:, :L].tolist()))
+            )
+
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
@@ -150,19 +159,17 @@ class QwenRetrievalModel(nn.Module):
             batch_size, -1
         )
 
-    def _check_valid_prefix(
-        self, prefix: torch.Tensor, batch_size: int = 100000
-    ) -> torch.Tensor:
-        if prefix.device != self.codebooks.device:
-            self.codebooks = self.codebooks.to(prefix.device)
-        trimmed = self.codebooks[:, : prefix.shape[1]]
-        results = []
-        for i in range(0, prefix.shape[0], batch_size):
-            batch = prefix[i : i + batch_size]
-            results.append(
-                (trimmed.unsqueeze(1) == batch.unsqueeze(0)).all(dim=2).any(dim=0)
-            )
-        return torch.cat(results)
+    def _check_valid_prefix(self, prefix: torch.Tensor) -> torch.Tensor:
+        """Return a bool tensor indicating which rows of ``prefix`` are valid.
+
+        Uses pre-computed CPU sets for O(1) lookup per row, avoiding the large
+        GPU broadcasts that previously caused cudaErrorUnknown / OOM errors.
+        """
+        L = prefix.shape[1]
+        prefix_set = self._prefix_sets[L - 1]  # built in __init__
+        rows = prefix.cpu().tolist()
+        valid = [tuple(row) in prefix_set for row in rows]
+        return torch.tensor(valid, dtype=torch.bool, device=prefix.device)
 
     def _get_last_valid_hidden(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor

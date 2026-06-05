@@ -185,3 +185,63 @@ class RqVae(nn.Module, PyTorchModelHubMixin):
             embs_norm=embs_norm,
             p_unique_ids=p_unique_ids,
         )
+
+    def forward_pair(
+        self, x_src: Tensor, x_tgt: Tensor, gumbel_t: float
+    ) -> RqVaeComputedLosses:
+        """Cross-modal forward pass for alignment-pair training.
+
+        Encodes ``x_src``, passes through the residual codebook stack, then
+        decodes and computes the reconstruction loss against ``x_tgt``.  This
+        enables all four alignment-pair types:
+
+            text  → text   (x_src = text_emb,  x_tgt = text_emb)
+            image → image  (x_src = image_emb, x_tgt = image_emb)
+            text  → image  (x_src = text_emb,  x_tgt = image_emb)
+            image → text   (x_src = image_emb, x_tgt = text_emb)
+
+        Because SigLIP places text and image embeddings in the same 1152-dim
+        space, the same encoder, codebook, and decoder handle all pair types
+        without any architectural change.
+
+        Parameters
+        ----------
+        x_src : Tensor  (B, input_dim)  — source modality embedding (encoder input)
+        x_tgt : Tensor  (B, input_dim)  — target modality embedding (decoder target)
+        gumbel_t : float                — Gumbel-softmax temperature
+
+        Returns
+        -------
+        RqVaeComputedLosses
+        """
+        x_src = x_src.to(next(self.encoder.parameters()).dtype)
+        x_tgt = x_tgt.to(next(self.encoder.parameters()).dtype)
+
+        quantized = self.get_semantic_ids(x_src, gumbel_t)
+        embs = quantized.embeddings  # (n_layers, embed_dim, B)
+        x_hat = self.decode(embs.sum(axis=-1))  # (B, input_dim)
+
+        # Reconstruct against the TARGET modality, not the source
+        reconstruction_loss = self.reconstruction_loss(x_hat, x_tgt)
+        rqvae_loss = quantized.quantize_loss
+        loss = (reconstruction_loss + rqvae_loss).mean()
+
+        with torch.no_grad():
+            embs_norm = embs.norm(dim=1)
+            p_unique_ids = (
+                ~torch.triu(
+                    (
+                        rearrange(quantized.sem_ids, "b d -> b 1 d")
+                        == rearrange(quantized.sem_ids, "b d -> 1 b d")
+                    ).all(axis=-1),
+                    diagonal=1,
+                )
+            ).all(axis=1).sum() / quantized.sem_ids.shape[0]
+
+        return RqVaeComputedLosses(
+            loss=loss,
+            reconstruction_loss=reconstruction_loss.mean(),
+            rqvae_loss=rqvae_loss.mean(),
+            embs_norm=embs_norm,
+            p_unique_ids=p_unique_ids,
+        )

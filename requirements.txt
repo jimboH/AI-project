@@ -19,3 +19,12 @@ wandb>=0.17.0
 # Data handling
 numpy>=1.24.0
 tqdm>=4.66.0
+
+# Multimodal generative retrieval (train_qwen_full.py)
+# Install unsloth from GitHub to avoid torch version cap:
+#   pip install "unsloth @ git+https://github.com/unslothai/unsloth.git" --no-deps
+#   pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git" --no-deps
+unsloth>=2026.6.1
+trl>=0.18.2
+peft>=0.14.0
+bitsandbytes>=0.44.0
