@@ -246,6 +246,217 @@ Additional flags (must match training configuration):
 
 ---
 
+## Qwen Full Fine-tuning (`train_qwen_full.sh`)
+
+`train_qwen_full.sh` fine-tunes **Qwen3.5-0.8B** (all 866M parameters, no LoRA) on two joint
+tasks:
+
+- **Task 1** — Given a product image + metadata, predict its semantic ID.
+- **Task 2** — Given a user's interaction history (in one of four formats), predict the next
+  item's semantic ID.
+
+Every batch is 50/50 Task 1 / Task 2 via `HalfHalfBatchSampler`.
+
+---
+
+### Quick start
+
+```bash
+# Default: semantic_id history, 500 steps, outputs/qwen_full
+bash train_qwen_full.sh
+
+# Image-based interaction history — 20 000 steps on GPU 1
+HISTORICAL_INPUTS=image MAX_STEPS=20000 OUTPUT_DIR=outputs/qwen_v2_image_input \
+    CUDA_VISIBLE_DEVICES=1 bash train_qwen_full.sh
+```
+
+The second command is the canonical way to run a long image-history fine-tune on a specific GPU.
+Set `CUDA_VISIBLE_DEVICES` to whichever device you want (e.g. `0`, `1`, `2,3`).
+
+---
+
+### `HISTORICAL_INPUTS` modes
+
+The `HISTORICAL_INPUTS` variable controls how the Task 2 interaction history is represented in
+the prompt sent to the model:
+
+| Mode          | Prompt content                                           | Notes                                               |
+|---------------|----------------------------------------------------------|-----------------------------------------------------|
+| `semantic_id` | Raw semantic token strings (`<\|d0_12\|><\|d1_5\|>…`)  | Default; text-only; fastest dataloader             |
+| `text`        | Product title + details (text only)                      | Richer context; still text-only                    |
+| `image`       | Product thumbnail for each history item                  | Requires `MAX_HISTORY_ITEMS` to avoid token budget overflow |
+| `multimodal`  | Thumbnail + title + details per history item             | Highest context; highest VRAM / sequence length    |
+
+**Image mode example:**
+```bash
+HISTORICAL_INPUTS=image \
+MAX_STEPS=20000 \
+OUTPUT_DIR=outputs/qwen_v2_image_input \
+CUDA_VISIBLE_DEVICES=1 \
+    bash train_qwen_full.sh
+```
+
+Add `MAX_HISTORY_ITEMS=3` (or 4–5) to cap how many past images appear in each prompt.
+Without a cap the sequence length can exceed `MAX_LENGTH`, triggering a Qwen3-VL
+`ValueError: Mismatch in image token count`.  The `LazyTask2Dataset` enforces the cap
+automatically via an auto-derived `max_images_per_sample` value, but setting
+`MAX_HISTORY_ITEMS` provides an additional token-length guarantee:
+
+```bash
+HISTORICAL_INPUTS=image MAX_HISTORY_ITEMS=3 MAX_STEPS=20000 \
+    OUTPUT_DIR=outputs/qwen_v2_image_input CUDA_VISIBLE_DEVICES=1 \
+    bash train_qwen_full.sh
+```
+
+---
+
+### All environment variables
+
+Every variable has a safe default; override any subset via the environment before calling the
+script:
+
+| Variable             | Default                        | Description                                               |
+|----------------------|-------------------------------|-----------------------------------------------------------|
+| `MAX_STEPS`          | `500`                          | Number of training steps                                  |
+| `LR`                 | `1e-5`                         | Learning rate                                             |
+| `BATCH_SIZE`         | `32`                           | Per-device batch size                                     |
+| `GRAD_ACCUM`         | `8`                            | Gradient accumulation (effective batch = BATCH × ACCUM)  |
+| `WARMUP_STEPS`       | `10`                           | LR warmup steps                                           |
+| `OUTPUT_DIR`         | `outputs/qwen_full`            | Checkpoint output directory                               |
+| `MAX_LENGTH`         | `4096`                         | Maximum token sequence length                             |
+| `IMAGE_SIZE`         | `0`                            | Pre-resize images to N×N before processor (0 = native)   |
+| `MODEL_NAME`         | `unsloth/Qwen3.5-0.8B`        | HuggingFace model ID                                      |
+| `HISTORICAL_INPUTS`  | `semantic_id`                  | History feature: `semantic_id`, `text`, `image`, `multimodal` |
+| `MAX_HISTORY_ITEMS`  | *(empty — all)*               | Cap history depth; recommended 3–5 for image/multimodal  |
+| `WANDB_PROJECT`      | `gen-retrieval-decoder`        | W&B project name                                          |
+| `WANDB_RUN_NAME`     | `qwen_full_hist=…_Nsteps`     | W&B run name (auto-generated if unset)                    |
+| `DATALOADER_WORKERS` | `4`                            | Parallel tokenisation workers (keep ≤ floor(RAM_GB / 2)) |
+| `MAX_TASK1`          | *(empty — all ~112 K)*        | Cap Task 1 (items) dataset size                           |
+| `MAX_TASK2`          | *(empty — all ~5.6 K)*        | Cap Task 2 (interactions) dataset size                    |
+
+All variables can also be overridden by passing CLI flags directly after the script name:
+
+```bash
+bash train_qwen_full.sh --max_steps 2000 --output_dir outputs/my_run
+```
+
+CLI flags take precedence over environment variables.
+
+---
+
+### Selecting a GPU
+
+Use `CUDA_VISIBLE_DEVICES` to pin training to a specific device:
+
+```bash
+# Single GPU (device index 1)
+CUDA_VISIBLE_DEVICES=1 bash train_qwen_full.sh
+
+# Use device 0 (default when unset)
+bash train_qwen_full.sh
+```
+
+This is especially useful on multi-GPU machines where one GPU is already occupied by another
+run.
+
+---
+
+### Startup latency and Torch compilation
+
+The first step of a fresh run has a cold-start cost:
+
+| Condition                     | First-step delay  | Cause                                                              |
+|-------------------------------|-------------------|--------------------------------------------------------------------|
+| `TORCHDYNAMO_DISABLE` unset   | 8–20 minutes      | Torch Inductor compiles every Triton kernel for the 0.8B + ViT graph |
+| `TORCHDYNAMO_DISABLE=1`       | 3–4 seconds       | CUDA allocator init + first-batch image prefetch only             |
+
+The compiled kernels are cached in `~/.cache/torch/inductor/` after the first run; subsequent
+launches skip compilation entirely and the first step takes the same 3–4 seconds as eager mode.
+
+To disable Dynamo for benchmarking or when you do not need kernel fusion:
+
+```bash
+TORCHDYNAMO_DISABLE=1 HISTORICAL_INPUTS=image MAX_STEPS=20000 \
+    OUTPUT_DIR=outputs/qwen_v2_image_input CUDA_VISIBLE_DEVICES=1 \
+    bash train_qwen_full.sh
+```
+
+**Why the hang happens (implementation note).** Before step 1, `training_step` used
+`torch.cuda.synchronize()` as a timing fence. On the very first step, CUDA's stream
+synchronize spin-waits in user-space while Torch Inductor compiles 150+ Triton kernels in a
+background subprocess — burning 100% CPU and showing 0% GPU for up to 20 minutes.
+This was replaced with non-blocking **CUDA Events** (`torch.cuda.Event(enable_timing=True)`),
+so the main thread is never blocked during compilation. The synchronize now only runs once
+every five steps *after* the GPU has already completed those steps, making it instantaneous.
+
+---
+
+### Performance benchmark
+
+Hardware: **NVIDIA RTX PRO 6000 Blackwell** (97.9 GB VRAM), 32 GB RAM.
+Config: `HISTORICAL_INPUTS=image`, native resolution (256×256 product images),
+`BATCH_SIZE=32`, `GRAD_ACCUM=8`, `MAX_LENGTH=4096`, 4 DataLoader workers.
+
+| Metric | Value |
+|--------|-------|
+| Step 1 cold-start | 18.7 s |
+| Steady-state throughput | **~16 s / gradient step** |
+| Effective samples per step | 256 (8 accum × 32 per-device) |
+| Throughput | **~16 samples / sec** |
+| GPU utilisation | **95–100%** |
+| GPU memory peak | ~79 GB / 97.9 GB (81%) |
+| Estimated 20 000-step run time | ~89 hours |
+
+Measured over 50 steps with `TORCHDYNAMO_DISABLE=1` (eager mode, no Triton compilation).
+With Dynamo enabled and a warm kernel cache the per-step time should be equal or lower.
+
+#### DataLoader architecture
+
+Each of the four workers is a **forked** clone of the main process (via
+`multiprocessing_context="fork"`).  Workers inherit the live Unsloth-patched processor
+at zero copy cost and run `apply_chat_template` + `Qwen3VLProcessor.__call__` (image
+normalisation + tokenisation) entirely on CPU, in parallel with the GPU's forward/backward
+pass.  The main thread only pads and stacks the pre-built tensors before sending the batch
+to the GPU.
+
+> **Why fork, not spawn?**  Unsloth's "patch everything" modifies Python/PyTorch's
+> multiprocessing IPC internals.  Under `spawn`, the patched main process sends a
+> truncated pickle stream to fresh worker processes, which then block forever waiting
+> for bytes that never arrive — GPU stays at 0%, no error is raised.  `fork` sidesteps
+> pickling entirely: workers inherit the full process image via copy-on-write.  Workers
+> are CPU-only (no CUDA calls), so the CUDA-after-fork restriction does not apply.
+> `TOKENIZERS_PARALLELISM=false` (set automatically in `main()`) prevents the Rust
+> tokeniser thread-pool from being forked in a bad state.
+
+---
+
+### Resuming a run
+
+```bash
+# Auto-detect the latest checkpoint inside OUTPUT_DIR
+HISTORICAL_INPUTS=image MAX_STEPS=20000 \
+    OUTPUT_DIR=outputs/qwen_v2_image_input CUDA_VISIBLE_DEVICES=1 \
+    bash train_qwen_full.sh --resume_from_checkpoint latest
+
+# Or point directly at a checkpoint folder
+bash train_qwen_full.sh --resume_from_checkpoint outputs/qwen_v2_image_input/checkpoint-5000
+```
+
+W&B run IDs are persisted in `<OUTPUT_DIR>/wandb_run_id.txt` so resumed runs continue the
+same W&B chart automatically.
+
+---
+
+### Quick smoke-test (sub-minute)
+
+```bash
+MAX_TASK1=200 MAX_TASK2=50 MAX_STEPS=5 \
+    HISTORICAL_INPUTS=image OUTPUT_DIR=outputs/smoke_test \
+    CUDA_VISIBLE_DEVICES=1 bash train_qwen_full.sh
+```
+
+---
+
 ## 3×3 Training and Testing Grid
 
 Nine grid cells cover every combination of training modality and testing modality:
