@@ -19,17 +19,23 @@ fi
 # ── Configurable defaults (override with env vars or CLI args below) ──────────
 MAX_STEPS="${MAX_STEPS:-500}"
 LR="${LR:-1e-5}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 WARMUP_STEPS="${WARMUP_STEPS:-10}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/qwen_full}"
-MAX_LENGTH="${MAX_LENGTH:-2048}"
+MAX_LENGTH="${MAX_LENGTH:-4096}"
 IMAGE_SIZE="${IMAGE_SIZE:-0}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-0.8B}"
+HISTORICAL_INPUTS="${HISTORICAL_INPUTS:-semantic_id}"
+MAX_HISTORY_ITEMS="${MAX_HISTORY_ITEMS:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-gen-retrieval-decoder}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_${MAX_STEPS}steps}"
-# Each worker forks ~1.7 GB RAM. Keep DATALOADER_WORKERS <= floor(free_RAM_GB / 2).
-# On a 32 GB machine with other jobs running, 4 is safe; push to 8 if RAM is free.
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_hist=${HISTORICAL_INPUTS}_${MAX_STEPS}steps}"
+# Each worker forks the parent process (~1.7 GB RAM inherited per worker).
+# With persistent_workers=True all workers spawn at DataLoader creation and
+# immediately fill the prefetch queue.
+# RAM budget: 16 workers × 1.7 GB = 27 GB on a 33 GB machine → OOM / hang at step 0.
+# Keep DATALOADER_WORKERS × 1.7 GB well below free RAM (free RAM ≈ 14 GB after model load).
+# 4 workers = safe ceiling for 32 GB machines at any image_size or batch_size.
 DATALOADER_WORKERS="${DATALOADER_WORKERS:-4}"
 
 # Task-1 / Task-2 sample caps (empty = use all data)
@@ -40,6 +46,7 @@ MAX_TASK2="${MAX_TASK2:-}"
 EXTRA_ARGS=()
 [[ -n "$MAX_TASK1" ]] && EXTRA_ARGS+=(--max_task1_samples "$MAX_TASK1")
 [[ -n "$MAX_TASK2" ]] && EXTRA_ARGS+=(--max_task2_samples "$MAX_TASK2")
+[[ -n "$MAX_HISTORY_ITEMS" ]] && EXTRA_ARGS+=(--max_history_items "$MAX_HISTORY_ITEMS")
 
 # Pass any CLI arguments straight through to the Python script
 EXTRA_ARGS+=("$@")
@@ -56,6 +63,8 @@ echo "  grad_accum   : $GRAD_ACCUM  (effective bs = $((BATCH_SIZE * GRAD_ACCUM))
 echo "  warmup_steps : $WARMUP_STEPS"
 echo "  output_dir   : $OUTPUT_DIR"
 echo "  image_size   : $IMAGE_SIZE"
+echo "  hist_inputs  : $HISTORICAL_INPUTS"
+[[ -n "$MAX_HISTORY_ITEMS" ]] && echo "  max_hist_items: $MAX_HISTORY_ITEMS"
 echo "  dl workers   : $DATALOADER_WORKERS"
 echo "  wandb project: $WANDB_PROJECT"
 echo "  wandb run    : $WANDB_RUN_NAME"
@@ -81,6 +90,7 @@ python train_qwen_full.py \
     --image_size        "$IMAGE_SIZE" \
     --model_name        "$MODEL_NAME" \
     --dataloader_workers "$DATALOADER_WORKERS" \
+    --historical_inputs "$HISTORICAL_INPUTS" \
     --wandb_project     "$WANDB_PROJECT" \
     --wandb_run_name    "$WANDB_RUN_NAME" \
     "${EXTRA_ARGS[@]}"
