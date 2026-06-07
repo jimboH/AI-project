@@ -9,7 +9,7 @@ train.train_data_subsample = False
 
 # Must match the trained RQ-VAE checkpoint
 # Qwen3-VL-Embedding-2B hidden size = 1536
-train.vae_input_dim = 1536
+train.vae_input_dim = 2048
 train.vae_embed_dim = 32
 train.vae_hidden_dims = [768, 512, 256]
 train.vae_codebook_size = 256

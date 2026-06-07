@@ -28,19 +28,19 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from datasets import load_dataset
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from data.schemas import FUT_SUFFIX, SeqBatch
+from data.schemas import FUT_SUFFIX, SeqBatch, TokenizedSeqBatch
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-DATASETS_DIR = Path("/work/u1304848/AI/project/datasets")
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATASETS_DIR = _PROJECT_ROOT / "datasets"
 IMAGE_DIR = DATASETS_DIR / "images"
-CACHE_DIR = Path("/work/u1304848/AI/project/outputs/embeddings")
+CACHE_DIR = _PROJECT_ROOT / "outputs" / "embeddings"
 
 # HuggingFace config names for sequential data
 # Pattern: 5core_last_out_w_his_{Category}
@@ -133,15 +133,14 @@ def load_sequential_data(
 ) -> Dict[str, dict]:
     """Build leave-one-out train/valid/test splits from HuggingFace data.
 
-    The test split of the HuggingFace ``5core_last_out_w_his`` config
+    The test split of the HuggingFace ``5core_last_out_w_his`` benchmark CSV
     provides each user's timestamp-ordered interaction history together
     with the absolute last item.  This function reconstructs the full
     sequence per user and applies the leave-one-out protocol:
 
       - Test  : history = [i_1, ..., i_{n-1}],  target = i_n
       - Valid : history = [i_1, ..., i_{n-2}],  target = i_{n-1}
-      - Train : history = [i_1, ..., i_{n-3}],  target = i_{n-2}
-                (requires n >= 4; used with subsample=True for augmentation)
+      - Train : all valid subsequences for k in {2,...,n-2}
 
     Items not present in ``asin2idx`` are skipped; users with fewer than
     3 metadata-filtered items are excluded.
@@ -153,27 +152,26 @@ def load_sequential_data(
         'target':      List[int],         # target item integer index
       }
     """
-    config_name = CATEGORY_TO_HF_CONFIG[category]
+    import pandas as pd
+    from huggingface_hub import hf_hub_download
+
     hf_cache = cache_dir or str(DATASETS_DIR / "hf_cache")
 
-    dataset = load_dataset(
-        "McAuley-Lab/Amazon-Reviews-2023",
-        config_name,
-        trust_remote_code=True,
+    # Download the benchmark test CSV directly — avoids the dataset loading
+    # script that newer versions of the `datasets` library no longer support.
+    csv_path = hf_hub_download(
+        repo_id="McAuley-Lab/Amazon-Reviews-2023",
+        filename=f"benchmark/5core/last_out_w_his/{category}.test.csv",
+        repo_type="dataset",
         cache_dir=hf_cache,
     )
-
-    if "test" not in dataset:
-        raise KeyError(
-            f"No 'test' split found in HuggingFace dataset for category '{category}'. "
-            "Cannot reconstruct full user sequences for leave-one-out splitting."
-        )
+    df = pd.read_csv(csv_path)
 
     train_data: Dict[str, list] = {"user_ids": [], "history": [], "target": []}
     valid_data: Dict[str, list] = {"user_ids": [], "history": [], "target": []}
     test_data: Dict[str, list] = {"user_ids": [], "history": [], "target": []}
 
-    for uid, row in enumerate(dataset["test"]):
+    for uid, row in df.iterrows():
         target_asin = row.get("parent_asin") or row.get("asin")
         history_raw = row.get("history", "")
         history_asins = history_raw.split() if isinstance(history_raw, str) else history_raw
@@ -321,6 +319,82 @@ class SequentialRecommendationDataset(Dataset):
 
         return SeqBatch(
             user_ids=torch.tensor([user_id], dtype=torch.long),
+            ids=item_ids,
+            ids_fut=item_ids_fut,
+            x=x,
+            x_fut=x_fut,
+            seq_mask=(item_ids >= 0),
+        )
+
+
+class PseudoQueryDataset(Dataset):
+    """Pseudo-query → target-item pairs for decoder training augmentation.
+
+    Each pseudo query (a synthetic text query produced by T5 doc2query) is
+    treated as a single-item user history.  The target is the real corpus
+    item the query was generated from.
+
+    Virtual item indices [corpus_size, corpus_size + N_pq) are used in
+    ``ids`` so the tokenizer looks them up from an extended cached_ids
+    tensor that must be appended to ``tokenizer.cached_ids`` before training.
+
+    Parameters
+    ----------
+    pq_embeddings : Tensor (N_pq, D)
+        Text embeddings of every pseudo query, pre-encoded with TextEncoder.
+    pq_targets : List[int]
+        Target corpus item index for each pseudo query.
+    corpus_size : int
+        Number of real items (= offset added to pq index to get virtual idx).
+    corpus_embeddings : Tensor (n_items, D)
+        Corpus item embeddings, used to fill ``x_fut``.
+    max_seq_len : int
+        Sequence length to pad/truncate to (must match the decoder config).
+    """
+
+    def __init__(
+        self,
+        pq_embeddings: Tensor,
+        pq_targets: List[int],
+        corpus_size: int,
+        corpus_embeddings: Tensor,
+        max_seq_len: int = MAX_SEQ_LEN,
+    ) -> None:
+        super().__init__()
+        assert len(pq_embeddings) == len(pq_targets), (
+            f"pq_embeddings ({len(pq_embeddings)}) and pq_targets ({len(pq_targets)}) "
+            "must have the same length."
+        )
+        self.pq_embeddings = pq_embeddings
+        self.pq_targets = pq_targets
+        self.corpus_size = corpus_size
+        self.corpus_embeddings = corpus_embeddings
+        self.max_seq_len = max_seq_len
+
+    def __len__(self) -> int:
+        return len(self.pq_targets)
+
+    def __getitem__(self, idx: int) -> SeqBatch:
+        pq_emb = self.pq_embeddings[idx]       # (D,)
+        target_idx = self.pq_targets[idx]
+
+        # Virtual index in the extended tokenizer cache
+        pq_item_idx = self.corpus_size + idx
+
+        # Single-item history padded to max_seq_len with -1
+        item_ids = torch.full((self.max_seq_len,), -1, dtype=torch.long)
+        item_ids[0] = pq_item_idx
+
+        item_ids_fut = torch.tensor([target_idx], dtype=torch.long)
+
+        # x: pseudo query embedding at position 0, zeros for padded positions
+        x = torch.zeros(self.max_seq_len, pq_emb.shape[0], dtype=torch.float32)
+        x[0] = pq_emb.float()
+
+        x_fut = self.corpus_embeddings[target_idx].unsqueeze(0)  # (1, D)
+
+        return SeqBatch(
+            user_ids=torch.tensor([0], dtype=torch.long),
             ids=item_ids,
             ids_fut=item_ids_fut,
             x=x,
