@@ -27,6 +27,19 @@ MAX_LENGTH="${MAX_LENGTH:-4096}"
 IMAGE_SIZE="${IMAGE_SIZE:-0}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-0.8B}"
 HISTORICAL_INPUTS="${HISTORICAL_INPUTS:-semantic_id}"
+# Default history cap per mode.
+# - semantic_id / text: no images, so the only sequence-length guard is this cap.
+#   Without it, users with 100–500 interactions produce prompt strings with
+#   thousands of special tokens, making DataLoader tokenisation 10–100× slower
+#   than image mode (where compute_max_images() auto-limits to ~1 item).
+#   20 items × ~8 tokens/item ≈ 160 extra tokens — well within a 4 096 budget.
+# - image / multimodal: compute_max_images() enforces its own hard cap via
+#   max_images; MAX_HISTORY_ITEMS here just adds an additional coarser guard.
+if [[ -z "${MAX_HISTORY_ITEMS:-}" ]]; then
+    if [[ "$HISTORICAL_INPUTS" == "semantic_id" || "$HISTORICAL_INPUTS" == "text" ]]; then
+        MAX_HISTORY_ITEMS=20
+    fi
+fi
 MAX_HISTORY_ITEMS="${MAX_HISTORY_ITEMS:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-gen-retrieval-decoder}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_hist=${HISTORICAL_INPUTS}_${MAX_STEPS}steps}"

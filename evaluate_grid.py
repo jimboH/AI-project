@@ -53,9 +53,11 @@ from data.utils import batch_to
 from evaluate.metrics import TopKAccumulator, NDCGAccumulator
 from modules.model import QwenRetrievalModel
 from modules.tokenizer.semids import SemanticIdTokenizer
+from modules.cross_modal_adapter import CrossModalAdapter
 
-EMBEDDING_BASE = Path("/work/u1304848/AI/project/outputs/embeddings")
-HF_CACHE = str(Path("/work/u1304848/AI/project/datasets/hf_cache"))
+EMBEDDING_BASE = Path(__file__).resolve().parent / "outputs" / "embeddings"
+ADAPTER_BASE   = Path(__file__).resolve().parent / "out" / "adapter"
+HF_CACHE = str(Path(__file__).resolve().parent / "datasets" / "hf_cache")
 
 MODALITIES = ["text", "image", "multimodal"]
 TOP_K_LIST = [1, 5, 10]
@@ -113,6 +115,32 @@ def load_asin_index(category: str):
 # Core evaluation
 # ---------------------------------------------------------------------------
 
+def _load_adapter(
+    adapter_dir: Optional[Path],
+    category: str,
+    src_modality: str,
+    tgt_modality: str,
+    device: str,
+) -> Optional[CrossModalAdapter]:
+    """Load a cross-modal adapter if one exists for this (src→tgt) pair."""
+    if adapter_dir is None:
+        return None
+    if src_modality == tgt_modality:
+        return None  # same modality — no adapter needed
+
+    # Convention: out/adapter/{category}/{src}_to_{tgt}/adapter_best.pt
+    tag      = f"{src_modality}_to_{tgt_modality}"
+    ckpt     = adapter_dir / category / tag / "adapter_best.pt"
+    if not ckpt.exists():
+        print(f"    [adapter] not found at {ckpt}, skipping adapter for this cell.")
+        return None
+
+    adapter = CrossModalAdapter.from_checkpoint(str(ckpt), device=device)
+    adapter.eval()
+    print(f"    [adapter] loaded {tag} adapter from {ckpt.relative_to(adapter_dir.parent)}")
+    return adapter
+
+
 def evaluate_cell(
     train_modality: str,
     test_modality: str,
@@ -120,6 +148,7 @@ def evaluate_cell(
     rqvae_dir: Path,
     decoder_dir: Path,
     device: str,
+    adapter_dir: Optional[Path] = None,
     qwen_model_name: str = "Qwen/Qwen3.5-0.8B",
     freeze_encoder: bool = False,
     top_k_for_generation: int = 20,
@@ -186,6 +215,18 @@ def evaluate_cell(
             test_emb_proj = test_embeddings[:, :vae_input_dim]
     else:
         test_emb_proj = test_embeddings
+
+    # ── Apply cross-modal adapter (fixes semantic-ID collapse) ──────────
+    adapter = _load_adapter(
+        adapter_dir=adapter_dir,
+        category=category,
+        src_modality=test_modality,
+        tgt_modality=train_modality,
+        device=device,
+    )
+    if adapter is not None:
+        with torch.no_grad():
+            test_emb_proj = adapter(test_emb_proj.to(device)).cpu()
 
     item_dataset = ItemEmbeddingDataset(test_emb_proj, split="all")
     corpus_ids = tokenizer.precompute_corpus_ids(item_dataset)
@@ -259,6 +300,7 @@ def run_grid(
     output_dir: Path,
     device: str,
     modalities: list = None,
+    adapter_dir: Optional[Path] = None,
     qwen_model_name: str = "Qwen/Qwen3.5-0.8B",
     freeze_encoder: bool = False,
     top_k_for_generation: int = 20,
@@ -288,6 +330,7 @@ def run_grid(
                 rqvae_dir=rqvae_dir,
                 decoder_dir=decoder_dir,
                 device=device,
+                adapter_dir=adapter_dir,
                 qwen_model_name=qwen_model_name,
                 freeze_encoder=freeze_encoder,
                 top_k_for_generation=top_k_for_generation,
@@ -404,15 +447,35 @@ def main():
         default=None,
         help="Number of user embedding bins (must match training; omit if not used).",
     )
+    parser.add_argument(
+        "--adapter_dir",
+        type=str,
+        default=None,
+        help="Root directory of cross-modal adapter checkpoints "
+             "(default: out/adapter/). Set to 'auto' to use the default path. "
+             "Adapters are looked up at "
+             "{adapter_dir}/{category}/{src}_to_{tgt}/adapter_best.pt. "
+             "Omit this flag to run without adapters (original behaviour).",
+    )
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    rqvae_dir = Path(args.rqvae_dir)
+    rqvae_dir   = Path(args.rqvae_dir)
     decoder_dir = Path(args.decoder_dir)
-    output_dir = Path(args.output_dir)
+    output_dir  = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.adapter_dir is None:
+        adapter_dir = None
+    elif args.adapter_dir == "auto":
+        adapter_dir = ADAPTER_BASE
+    else:
+        adapter_dir = Path(args.adapter_dir)
+
+    if adapter_dir is not None:
+        print(f"Cross-modal adapter dir: {adapter_dir}")
 
     modalities_to_use = args.modalities if args.modalities else MODALITIES
 
@@ -424,6 +487,7 @@ def main():
         output_dir=output_dir,
         device=device,
         modalities=modalities_to_use,
+        adapter_dir=adapter_dir,
         qwen_model_name=args.qwen_model_name,
         freeze_encoder=args.freeze_encoder,
         top_k_for_generation=args.top_k_for_generation,

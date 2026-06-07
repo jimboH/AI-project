@@ -356,7 +356,7 @@ def build_and_push_items_sharded(
                         img.save(buf, format="JPEG")
                         row[img_col] = {"bytes": buf.getvalue(), "path": None}
                     else:
-                        row[img_col] = {"bytes": None, "path": None}
+                        row[img_col] = None  # Arrow null, not a null struct
 
             # Build columnar dict for pyarrow
             cols = {col: [r[col] for r in rows] for col in rows[0]}

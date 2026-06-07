@@ -1,9 +1,10 @@
-"""Image encoder using Qwen/Qwen3-VL-Embedding-2B.
+"""Image encoder using google/siglip-so400m-patch14-384.
 
-Encodes product images into dense embeddings by passing image-only inputs
-through the VL model. Missing images are handled gracefully by returning
-zero vectors. Uses the same backbone as the text and multimodal encoders,
-producing 1536-dim embeddings consistent across all modalities.
+Encodes product images into dense embeddings via the SigLIP vision tower,
+which applies global average pooling followed by a learned projection,
+producing L2-normalised 1152-dim embeddings aligned with the text tower.
+
+Missing images are handled gracefully by returning zero vectors.
 """
 
 from __future__ import annotations
@@ -17,12 +18,12 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
+MODEL_NAME = "google/siglip-so400m-patch14-384"
 BATCH_SIZE = 8
 
 
 class ImageEncoder:
-    """Encode product images using Qwen3-VL-Embedding-2B.
+    """Encode product images using SigLIP's vision tower.
 
     Parameters
     ----------
@@ -32,11 +33,12 @@ class ImageEncoder:
     category : str
         Dataset category name (e.g. 'All_Beauty').
     model_name : str
-        HuggingFace VL model ID.
+        HuggingFace model ID.
     device : str or None
         Target device.
     embedding_dim : int or None
-        If set, projects to this dimension. Otherwise uses the model's native dim (1536).
+        If set, projects to this dimension. Otherwise uses the model's
+        native projection dimension (1152).
     """
 
     VARIANT_PRIORITY = ["MAIN", "PT01", "PT02", "PT03"]
@@ -52,19 +54,17 @@ class ImageEncoder:
         self.image_dir = Path(image_dir) / category
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        self.processor = AutoProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(
             model_name,
-            trust_remote_code=True,
             torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
         ).to(self.device)
         self.model.eval()
 
         cfg = self.model.config
-        self.native_dim = (
-            cfg.hidden_size if hasattr(cfg, "hidden_size") else cfg.text_config.hidden_size
+        self.native_dim = getattr(
+            cfg, "projection_dim",
+            getattr(cfg.vision_config, "hidden_size", 1152),
         )
         self.embedding_dim = embedding_dim or self.native_dim
 
@@ -90,33 +90,19 @@ class ImageEncoder:
         except Exception:
             return None
 
-    def _encode_image(self, image: Image.Image) -> torch.Tensor:
-        """Encode a single PIL image through the VL model."""
-        messages = [
-            {
-                "role": "user",
-                "content": [{"type": "image", "image": image}],
-            }
-        ]
-        text_input = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.processor(
-            text=[text_input],
-            images=[image],
-            return_tensors="pt",
-            padding=True,
-        )
+    def _encode_batch(self, images: List[Image.Image]) -> torch.Tensor:
+        """Encode a batch of PIL images in a single forward pass.
+
+        Returns
+        -------
+        Tensor of shape (B, native_dim), L2-normalised.
+        """
+        inputs = self.processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        outputs = self.model(**inputs, output_hidden_states=False)
-        last_hidden = outputs.last_hidden_state  # (1, T, D)
-        mask = inputs.get(
-            "attention_mask",
-            torch.ones(last_hidden.shape[:2], device=self.device),
-        ).unsqueeze(-1).float()
-        emb = (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        return F.normalize(emb.float(), p=2, dim=-1)[0]  # (D,)
+        # get_image_features returns the projected, pooled vision embedding.
+        emb = self.model.get_image_features(**inputs)  # (B, native_dim)
+        return F.normalize(emb.float(), p=2, dim=-1)
 
     @torch.no_grad()
     def encode(
@@ -127,6 +113,8 @@ class ImageEncoder:
         """Encode images for a list of ASINs.
 
         Items with missing or unreadable images get zero vectors.
+        Items within a batch that have valid images are processed together
+        in a single forward pass; items without images keep zero vectors.
 
         Returns
         -------
@@ -138,6 +126,9 @@ class ImageEncoder:
             batch_asins = asins[i : i + batch_size]
             batch_embs = torch.zeros(len(batch_asins), self.embedding_dim)
 
+            # Collect valid (index, image) pairs for batched encoding
+            valid_indices: List[int] = []
+            valid_images: List[Image.Image] = []
             for j, asin in enumerate(batch_asins):
                 path = self._find_image_path(asin)
                 if path is None:
@@ -145,15 +136,32 @@ class ImageEncoder:
                 image = self._load_image(path)
                 if image is None:
                     continue
+                valid_indices.append(j)
+                valid_images.append(image)
 
-                try:
-                    emb = self._encode_image(image)
-                    if self.projection is not None:
-                        emb = self.projection(emb.unsqueeze(0))[0]
-                        emb = F.normalize(emb, p=2, dim=-1)
-                    batch_embs[j] = emb.cpu()
-                except Exception:
-                    pass
+            if not valid_images:
+                all_embs.append(batch_embs)
+                continue
+
+            try:
+                embs = self._encode_batch(valid_images)  # (K, native_dim)
+                if self.projection is not None:
+                    embs = self.projection(embs)
+                    embs = F.normalize(embs, p=2, dim=-1)
+                for k, j in enumerate(valid_indices):
+                    batch_embs[j] = embs[k].cpu()
+            except Exception:
+                # Fall back to item-by-item on batch failure
+                for k, (j, image) in enumerate(zip(valid_indices, valid_images)):
+                    try:
+                        embs_single = self._encode_batch([image])  # (1, D)
+                        emb = embs_single[0]
+                        if self.projection is not None:
+                            emb = self.projection(emb.unsqueeze(0))[0]
+                            emb = F.normalize(emb, p=2, dim=-1)
+                        batch_embs[j] = emb.cpu()
+                    except Exception:
+                        pass
 
             all_embs.append(batch_embs)
 

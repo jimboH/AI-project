@@ -43,6 +43,7 @@ import wandb
 from accelerate import Accelerator
 from data.amazon2023 import (
     ItemEmbeddingDataset,
+    PseudoQueryDataset,
     SequentialRecommendationDataset,
     build_asin_index,
     load_metadata,
@@ -50,6 +51,7 @@ from data.amazon2023 import (
     METADATA_FILES,
 )
 from data.utils import batch_to, cycle, next_batch
+from torch.utils.data import ConcatDataset
 from evaluate.metrics import TopKAccumulator, NDCGAccumulator
 from modules.model import QwenRetrievalModel
 from modules.scheduler.inv_sqrt import InverseSquareRootScheduler
@@ -60,8 +62,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pathlib import Path
 
-EMBEDDING_BASE = Path("/work/u1304848/AI/project/outputs/embeddings")
-HF_CACHE = str(Path("/work/u1304848/AI/project/datasets/hf_cache"))
+EMBEDDING_BASE = Path(__file__).resolve().parent / "outputs" / "embeddings"
+HF_CACHE = str(Path(__file__).resolve().parent / "datasets" / "hf_cache")
 
 
 def setup_logger(log_path: str) -> logging.Logger:
@@ -129,6 +131,7 @@ def train(
     save_dir_root: str = "out/decoder/",
     run_name: str = None,
     pretrained_decoder_path: str = None,
+    pseudo_query_emb_path: str = None,
     save_model_every: int = 2000,
     eval_every: int = 2000,
     top_k_eval_list=(1, 5, 10),
@@ -139,6 +142,7 @@ def train(
     # Logging
     log_every: int = 100,
     wandb_logging: bool = False,
+    wandb_project: str = "gen-retrieval-decoder",
     force_seq_reload: bool = False,
 ):
     if wandb_logging:
@@ -215,7 +219,77 @@ def train(
         print("Precomputing corpus semantic IDs...")
     tokenizer.precompute_corpus_ids(item_dataset)
 
+    # codebooks must be extracted before any pseudo-query extension so that
+    # beam-search generation only considers real corpus items as candidates.
     codebooks = tokenizer.cached_ids[:, :vae_n_layers].cpu()
+
+    # ------------------------------------------------------------------
+    # Optional pseudo-query augmentation (text modality recommended only)
+    # ------------------------------------------------------------------
+    if pseudo_query_emb_path is not None:
+        pq_emb_path = Path(pseudo_query_emb_path)
+        pq_tgt_path = pq_emb_path.parent / "pseudo_query_targets.json"
+
+        if not pq_emb_path.exists():
+            if accelerator.is_main_process:
+                print(f"[pseudo_queries] {pq_emb_path} not found — skipping augmentation.")
+        else:
+            pq_embeddings = torch.load(
+                pq_emb_path, map_location="cpu", weights_only=False
+            ).float()
+            with open(pq_tgt_path) as _f:
+                pq_targets = json.load(_f)
+
+            n_corpus = len(all_embeddings)
+
+            if accelerator.is_main_process:
+                print(
+                    f"[pseudo_queries] Tokenising {len(pq_embeddings):,} pseudo queries "
+                    f"via frozen RQ-VAE..."
+                )
+
+            # Tokenise pseudo queries through the frozen RQ-VAE in batches
+            rqvae = accelerator.unwrap_model(tokenizer).rq_vae
+            rqvae_device = next(rqvae.parameters()).device
+            pq_sem_id_chunks = []
+            _tok_bs = 256
+            with torch.no_grad():
+                for _i in range(0, len(pq_embeddings), _tok_bs):
+                    _batch = pq_embeddings[_i : _i + _tok_bs].to(rqvae_device)
+                    _sem = rqvae.get_semantic_ids(_batch).sem_ids  # (B, n_layers)
+                    pq_sem_id_chunks.append(_sem.cpu())
+            pq_sem_ids = torch.cat(pq_sem_id_chunks, dim=0)  # (N_pq, n_layers)
+
+            # Append dedup column of zeros (pseudo queries are treated as unique)
+            _dedup = torch.zeros(len(pq_sem_ids), 1, dtype=pq_sem_ids.dtype)
+            pq_cached = torch.cat([pq_sem_ids, _dedup], dim=1)  # (N_pq, n_layers+1)
+
+            # Extend tokenizer cached_ids so pq virtual indices resolve correctly
+            tokenizer.cached_ids = torch.cat(
+                [tokenizer.cached_ids.cpu(), pq_cached], dim=0
+            )
+
+            # Build PseudoQueryDataset and merge with the regular training set
+            pq_train_dataset = PseudoQueryDataset(
+                pq_embeddings=pq_embeddings,
+                pq_targets=pq_targets,
+                corpus_size=n_corpus,
+                corpus_embeddings=all_embeddings,
+                max_seq_len=max_seq_len,
+            )
+            combined_train = ConcatDataset([train_dataset, pq_train_dataset])
+            train_dataloader = DataLoader(
+                combined_train, batch_size=batch_size, shuffle=True
+            )
+            train_dataloader = cycle(train_dataloader)
+            train_dataloader = accelerator.prepare(train_dataloader)
+
+            if accelerator.is_main_process:
+                print(
+                    f"[pseudo_queries] Augmented training set: "
+                    f"{len(train_dataset):,} real + {len(pq_train_dataset):,} pq "
+                    f"= {len(combined_train):,} total examples."
+                )
 
     model = QwenRetrievalModel(
         codebooks=codebooks,
@@ -255,8 +329,11 @@ def train(
     best_ndcg10 = -1.0
 
     if wandb_logging and accelerator.is_main_process:
-        wandb.login()
-        wandb.init(project="gen-retrieval-decoder-training", config=params)
+        wandb.init(
+            project=wandb_project,
+            name=run_name or f"{category}_{modality}",
+            config=params,
+        )
 
     dir_name = run_name if run_name else modality
     save_dir = os.path.join(save_dir_root, f"{category}/{dir_name}/")
@@ -379,43 +456,51 @@ def train(
 
                     if ndcg10 > best_ndcg10:
                         best_ndcg10 = ndcg10
-                        state = {
+                        # Save model weights only — no optimizer/scheduler state.
+                        # Keeps checkpoint_best.pt small (~1.6 GB) for inference and
+                        # evaluation without storing the large AdamW moment buffers.
+                        best_state = {
                             "iter": iter,
                             "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "scheduler": lr_scheduler.state_dict(),
                             "category": category,
                             "modality": modality,
                         }
-                        torch.save(state, os.path.join(save_dir, "checkpoint_best.pt"))
+                        torch.save(best_state, os.path.join(save_dir, "checkpoint_best.pt"))
                         logger.info(
                             "iter=%d  [new best]  ndcg@10=%.4f", iter + 1, ndcg10
                         )
 
                     if wandb_logging:
-                        wandb.log({"eval_loss": eval_loss, "iter": iter, **eval_metrics})
+                        wandb.log(
+                            {"eval/loss": eval_loss, **{f"eval/{k}": v for k, v in eval_metrics.items()}},
+                            step=iter + 1,
+                        )
 
             if accelerator.is_main_process:
-                state = {
-                    "iter": iter,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": lr_scheduler.state_dict(),
-                    "category": category,
-                    "modality": modality,
-                }
                 os.makedirs(save_dir, exist_ok=True)
 
                 if (iter + 1) % save_model_every == 0 or iter + 1 == iterations:
-                    torch.save(state, os.path.join(save_dir, f"checkpoint_{iter}.pt"))
+                    # Overwrite a single rotating checkpoint rather than accumulating
+                    # one file per save interval.  Storing model + optimizer here so
+                    # training can be resumed from this file if needed.
+                    latest_state = {
+                        "iter": iter,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": lr_scheduler.state_dict(),
+                        "category": category,
+                        "modality": modality,
+                    }
+                    torch.save(latest_state, os.path.join(save_dir, "checkpoint_latest.pt"))
 
-                if wandb_logging:
+                if wandb_logging and (iter + 1) % log_every == 0:
                     wandb.log(
                         {
-                            "learning_rate": optimizer.param_groups[0]["lr"],
-                            "total_loss": total_loss,
-                            **train_debug_metrics,
-                        }
+                            "train/loss": total_loss,
+                            "train/learning_rate": optimizer.param_groups[0]["lr"],
+                            **{f"train/{k}": v for k, v in train_debug_metrics.items()},
+                        },
+                        step=iter + 1,
                     )
 
             pbar.update(1)

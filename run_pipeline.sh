@@ -17,9 +17,10 @@ set -euo pipefail
 
 CATEGORY="${1:-All_Beauty}"
 MODALITY="${2:-all}"
-PYTHON="/work/u1304848/.conda/envs/AI1/bin/python3"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${SCRIPT_DIR}/env/bin/python3"
 
-cd /work/u1304848/AI/project
+cd "$SCRIPT_DIR"
 
 echo "=========================================="
 echo " Generative Recommendation Pipeline"
@@ -32,7 +33,7 @@ echo "=========================================="
 # ---------------------------------------------------------------------------
 echo ""
 echo "[1/4] Precomputing embeddings..."
-$PYTHON precompute_embeddings.py --category "$CATEGORY" --modality "$MODALITY"
+#$PYTHON precompute_embeddings.py --category "$CATEGORY" --modality "$MODALITY"
 
 # ---------------------------------------------------------------------------
 # Step 2: Train RQ-VAE (one per modality)
@@ -52,13 +53,13 @@ run_rqvae() {
     fi
 }
 
-if [ "$MODALITY" = "all" ]; then
-    run_rqvae text
-    run_rqvae image
-    run_rqvae multimodal
-else
-    run_rqvae "$MODALITY"
-fi
+#if [ "$MODALITY" = "all" ]; then
+#    run_rqvae text
+#    run_rqvae image
+#    run_rqvae multimodal
+#else
+#    run_rqvae "$MODALITY"
+#fi
 
 # ---------------------------------------------------------------------------
 # Step 3: Train decoder (one per modality)
@@ -78,7 +79,7 @@ run_decoder() {
 }
 
 if [ "$MODALITY" = "all" ]; then
-    run_decoder text
+    # run_decoder text
     run_decoder image
     run_decoder multimodal
 else

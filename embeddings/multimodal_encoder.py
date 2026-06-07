@@ -1,14 +1,17 @@
-"""Multimodal encoder using Qwen/Qwen3-VL-Embedding-2B.
+"""Multimodal encoder using google/siglip-so400m-patch14-384.
 
-Combines text (item metadata) and images into joint embeddings via mean
-pooling over the final hidden layer, then L2-normalised. Uses the same
-VL backbone as the text and image encoders so all three modalities produce
-consistent 1536-dim embeddings. Missing images are handled gracefully.
+Combines text (item metadata) and images into joint embeddings by computing
+both modality features from SigLIP's shared model and returning their
+L2-normalised sum.  Since SigLIP is a contrastive model, text and image
+embeddings already occupy the same 1152-dim space, so a simple unit-norm
+average is a principled fusion strategy.
+
+When an item has no image, the text embedding is returned unchanged.
+Both modalities are computed in a single model load to save GPU memory.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -18,16 +21,21 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
-MAX_TEXT_LEN = 400
-MAX_IMAGES_PER_ITEM = 3
+MODEL_NAME = "google/siglip-so400m-patch14-384"
 BATCH_SIZE = 8
 
 VARIANT_PRIORITY = ["MAIN", "PT01", "PT02", "PT03"]
 
 
 class MultimodalEncoder:
-    """Encode items using both text metadata and product images.
+    """Encode items using both text metadata and product images via SigLIP.
+
+    For each item the text and image embeddings are each computed via the
+    respective SigLIP tower, then fused as:
+
+        multimodal_emb = L2_normalize(text_emb + image_emb)
+
+    Items with no image fall back to the text embedding alone.
 
     Parameters
     ----------
@@ -36,11 +44,11 @@ class MultimodalEncoder:
     category : str
         Dataset category name (e.g. 'All_Beauty').
     model_name : str
-        HuggingFace model ID for the multimodal embedding model.
+        HuggingFace model ID for the SigLIP model.
     device : str or None
         Target device.
     embedding_dim : int or None
-        Output dimension; projects if different from model native dim.
+        Output dimension; projects if different from model native dim (1152).
     """
 
     def __init__(
@@ -54,19 +62,18 @@ class MultimodalEncoder:
         self.image_dir = Path(image_dir) / category
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        # Single model load — SigLIP text and vision towers share one checkpoint
+        self.processor = AutoProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(
             model_name,
-            trust_remote_code=True,
             torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
         ).to(self.device)
         self.model.eval()
 
         cfg = self.model.config
-        self.native_dim = (
-            cfg.hidden_size if hasattr(cfg, "hidden_size") else cfg.text_config.hidden_size
+        self.native_dim = getattr(
+            cfg, "projection_dim",
+            getattr(cfg.text_config, "hidden_size", 1152),
         )
         self.embedding_dim = embedding_dim or self.native_dim
 
@@ -76,26 +83,54 @@ class MultimodalEncoder:
                 self.native_dim, embedding_dim, bias=False
             ).to(self.device)
 
+    # ------------------------------------------------------------------
+    # Image helpers
+    # ------------------------------------------------------------------
+
     def _find_images(self, asin: str) -> List[Image.Image]:
-        images = []
+        """Return up to one usable image for an ASIN (MAIN variant first)."""
         for variant in VARIANT_PRIORITY:
             path = self.image_dir / f"{asin}_{variant}.jpg"
             if path.exists():
                 try:
-                    images.append(Image.open(path).convert("RGB"))
+                    return [Image.open(path).convert("RGB")]
                 except Exception:
                     pass
-            if len(images) >= MAX_IMAGES_PER_ITEM:
-                break
-        return images
+        for f in self.image_dir.glob(f"{asin}_*.jpg"):
+            try:
+                return [Image.open(f).convert("RGB")]
+            except Exception:
+                pass
+        return []
 
-    def _build_content(self, text: str, images: List[Image.Image]) -> List[dict]:
-        """Build multimodal content list for the processor."""
-        content = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": text[:MAX_TEXT_LEN]})
-        return content
+    # ------------------------------------------------------------------
+    # Encoding helpers
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _encode_texts(self, texts: List[str]) -> torch.Tensor:
+        """Encode a batch of text strings. Returns (B, native_dim) L2-normed."""
+        inputs = self.processor(
+            text=texts,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        emb = self.model.get_text_features(**inputs)  # (B, native_dim)
+        return F.normalize(emb.float(), p=2, dim=-1)
+
+    @torch.no_grad()
+    def _encode_images(self, images: List[Image.Image]) -> torch.Tensor:
+        """Encode a list of PIL images. Returns (B, native_dim) L2-normed."""
+        inputs = self.processor(images=images, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        emb = self.model.get_image_features(**inputs)  # (B, native_dim)
+        return F.normalize(emb.float(), p=2, dim=-1)
+
+    # ------------------------------------------------------------------
+    # Public encode
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def encode(
@@ -104,7 +139,11 @@ class MultimodalEncoder:
         texts: List[str],
         batch_size: int = BATCH_SIZE,
     ) -> torch.Tensor:
-        """Encode items using text + images.
+        """Encode items using text + images (falls back to text-only if no image).
+
+        For each item:
+        - If image available: multimodal_emb = L2_normalize(text_emb + image_emb)
+        - If no image: multimodal_emb = text_emb
 
         Parameters
         ----------
@@ -122,45 +161,60 @@ class MultimodalEncoder:
         for i in tqdm(range(0, len(asins), batch_size), desc="Encoding multimodal"):
             batch_asins = asins[i : i + batch_size]
             batch_texts = texts[i : i + batch_size]
-            batch_embs = torch.zeros(len(batch_asins), self.embedding_dim)
+            B = len(batch_asins)
 
-            for j, (asin, text) in enumerate(zip(batch_asins, batch_texts)):
-                images = self._find_images(asin)
-                content = self._build_content(text, images)
+            # --- Text embeddings (always computed) ---
+            try:
+                txt_embs = self._encode_texts(batch_texts)  # (B, D)
+            except Exception:
+                # Fall back to item-by-item text encoding on failure
+                txt_embs = torch.zeros(B, self.native_dim, device=self.device)
+                for j, t in enumerate(batch_texts):
+                    try:
+                        txt_embs[j] = self._encode_texts([t])[0]
+                    except Exception:
+                        pass
 
+            # --- Image embeddings (only for items that have an image) ---
+            item_images: List[Optional[Image.Image]] = []
+            for asin in batch_asins:
+                imgs = self._find_images(asin)
+                item_images.append(imgs[0] if imgs else None)
+
+            # Collect valid image indices
+            valid_idx = [j for j, img in enumerate(item_images) if img is not None]
+            valid_imgs = [item_images[j] for j in valid_idx]
+
+            img_embs = torch.zeros(B, self.native_dim, device=self.device)
+            if valid_imgs:
                 try:
-                    messages = [{"role": "user", "content": content}]
-                    text_input = self.processor.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    inputs = self.processor(
-                        text=[text_input],
-                        images=images if images else None,
-                        return_tensors="pt",
-                        padding=True,
-                    )
-                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    encoded = self._encode_images(valid_imgs)  # (K, D)
+                    for k, j in enumerate(valid_idx):
+                        img_embs[j] = encoded[k]
+                except Exception:
+                    # Fall back item-by-item
+                    for j, img in zip(valid_idx, valid_imgs):
+                        try:
+                            img_embs[j] = self._encode_images([img])[0]
+                        except Exception:
+                            pass
 
-                    outputs = self.model(**inputs, output_hidden_states=False)
-                    last_hidden = outputs.last_hidden_state  # (1, T, D)
-                    # Mean pool over all tokens
-                    mask = inputs.get("attention_mask", torch.ones_like(
-                        last_hidden[:, :, 0]
-                    )).unsqueeze(-1).float()
-                    emb = (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-                    emb = F.normalize(emb.float(), p=2, dim=-1)
+            # --- Fuse: average where image is available, else text-only ---
+            batch_embs = torch.zeros(B, self.embedding_dim)
+            for j in range(B):
+                if item_images[j] is not None and img_embs[j].norm() > 0:
+                    # L2-normalised sum (unit-norm average direction)
+                    fused = F.normalize(
+                        (txt_embs[j] + img_embs[j]).unsqueeze(0), p=2, dim=-1
+                    )[0]
+                else:
+                    fused = txt_embs[j]
 
-                    if self.projection is not None:
-                        emb = self.projection(emb)
-                        emb = F.normalize(emb, p=2, dim=-1)
+                if self.projection is not None:
+                    fused = self.projection(fused.unsqueeze(0))[0]
+                    fused = F.normalize(fused, p=2, dim=-1)
 
-                    batch_embs[j] = emb[0].cpu()
-
-                except Exception as e:
-                    # Item with encoding error gets zero vector
-                    pass
+                batch_embs[j] = fused.cpu()
 
             all_embs.append(batch_embs)
 

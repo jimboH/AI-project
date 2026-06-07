@@ -1,9 +1,11 @@
-"""Text encoder using Qwen/Qwen3-VL-Embedding-2B.
+"""Text encoder using google/siglip-so400m-patch14-384.
 
-Encodes item metadata text prompts into dense embeddings via
-last-token mean pooling over the final hidden layer, then L2-normalised.
-Uses the same VL backbone as the image and multimodal encoders so all
-three modalities share a common 1536-dim embedding space.
+Encodes item metadata text into dense embeddings via the SigLIP text tower,
+which applies a learned CLS-style pooling and produces L2-normalised 1152-dim
+embeddings aligned with the SigLIP vision tower.
+
+Note: SigLIP's text tokenizer is capped at 64 tokens. Inputs are truncated
+automatically by the processor.
 """
 
 from __future__ import annotations
@@ -14,26 +16,26 @@ from transformers import AutoModel, AutoProcessor
 from typing import List, Optional
 from tqdm import tqdm
 
-MODEL_NAME = "Qwen/Qwen3-VL-Embedding-2B"
-MAX_TEXT_LEN = 512
-BATCH_SIZE = 16
+MODEL_NAME = "google/siglip-so400m-patch14-384"
+BATCH_SIZE = 32
 
 
 class TextEncoder:
-    """Encode text strings into fixed-size embeddings using Qwen3-VL-Embedding-2B.
+    """Encode text strings into fixed-size embeddings using SigLIP's text tower.
 
-    Text is formatted as a single-turn user message and processed through
-    the VL model's chat template (image slots are omitted).
+    Text is passed directly to the SigLIP processor (no chat template).
+    The processor handles tokenisation and padding/truncation to 64 tokens.
+    Embeddings are L2-normalised pooled outputs from the text model.
 
     Parameters
     ----------
     model_name : str
-        HuggingFace model ID. Defaults to Qwen/Qwen3-VL-Embedding-2B.
+        HuggingFace model ID. Defaults to google/siglip-so400m-patch14-384.
     device : str
         Target device ('cuda', 'cpu', etc.).
     embedding_dim : int or None
         If set, adds a linear projection layer to this dimensionality.
-        If None, uses the model's native hidden size (1536).
+        If None, uses the model's native hidden size (1152).
     """
 
     def __init__(
@@ -44,19 +46,19 @@ class TextEncoder:
     ) -> None:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+        self.processor = AutoProcessor.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(
             model_name,
-            trust_remote_code=True,
             torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
         ).to(self.device)
         self.model.eval()
 
+        # SigLIP text projection dimension
         cfg = self.model.config
-        self.native_dim = (
-            cfg.hidden_size if hasattr(cfg, "hidden_size") else cfg.text_config.hidden_size
+        # text_config.hidden_size is the projection output dim for SigLIP
+        self.native_dim = getattr(
+            cfg, "projection_dim",
+            getattr(cfg.text_config, "hidden_size", 1152),
         )
         self.embedding_dim = embedding_dim or self.native_dim
 
@@ -65,28 +67,6 @@ class TextEncoder:
             self.projection = torch.nn.Linear(
                 self.native_dim, embedding_dim, bias=False
             ).to(self.device)
-
-    def _build_inputs(self, texts: List[str]):
-        """Build processor inputs for a batch of text-only items."""
-        formatted = []
-        for text in texts:
-            messages = [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text[:MAX_TEXT_LEN]}],
-                }
-            ]
-            formatted.append(
-                self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-            )
-        return self.processor(
-            text=formatted,
-            images=None,
-            return_tensors="pt",
-            padding=True,
-        )
 
     @torch.no_grad()
     def encode(self, texts: List[str], batch_size: int = BATCH_SIZE) -> torch.Tensor:
@@ -99,15 +79,19 @@ class TextEncoder:
         all_embs = []
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding text"):
             batch = texts[i : i + batch_size]
-            inputs = self._build_inputs(batch)
+            inputs = self.processor(
+                text=batch,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            outputs = self.model(**inputs, output_hidden_states=False)
-            last_hidden = outputs.last_hidden_state  # (B, T, D)
-
-            mask = inputs["attention_mask"].unsqueeze(-1).float()
-            emb = (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            # SigLIP exposes get_text_features() which returns the projected,
+            # L2-normalised pooled embedding directly.
+            emb = self.model.get_text_features(**inputs)  # (B, native_dim)
             emb = F.normalize(emb.float(), p=2, dim=-1)
+
             if self.projection is not None:
                 emb = self.projection(emb)
                 emb = F.normalize(emb, p=2, dim=-1)

@@ -1,27 +1,51 @@
 #!/usr/bin/env python3
 """Generate semantic IDs for all items using a trained RQ-VAE checkpoint.
 
-Encodes every item's text embedding through the frozen RQ-VAE to produce a
+Encodes every item's embedding through the frozen RQ-VAE to produce a
 discrete code tuple (c0, c1, c2).  Items that share the same 3-code tuple
 receive a 4th disambiguation code c3 equal to their collision rank (0-indexed),
 matching the convention used by SemanticIdTokenizer.precompute_corpus_ids.
 
+Modality handling
+-----------------
+Standard (full-modality) run — use --embeddings:
+  The provided tensor is used as-is (typically text_embeddings.pt).
+
+Limited-modality run — use --text_embeddings, --image_embeddings, and
+  --modality_mask_path together:
+  A per-item composite embedding is built:
+    "both" / "text_only" items  → text_embeddings[i]
+    "image_only" items          → image_embeddings[i]
+  This ensures image_only items get semantic IDs derived from their image
+  embedding (their text embedding row is zeroed out in the limited tensors).
+
 Outputs
 -------
-- <save_dir>/semantic_ids.json        : {asin: [c0, c1, c2]} or {asin: [c0,c1,c2,c3]}
-- <save_dir>/semantic_id_tokens.json  : {asin: "<|d0_X|> <|d1_Y|> <|d2_Z|>"}  (token strings)
+- <save_dir>/semantic_ids.json        : {asin: [c0, c1, c2, c3]}
+- <save_dir>/semantic_id_tokens.json  : {asin: "<|d0_X|> <|d1_Y|> <|d2_Z|>"}
 
 Then optionally rewrites every JSONL file under data/<data_dir>/ with
 updated `doc_id` and `item` fields.
 
 Usage
 -----
+  # Standard (full-modality)
   python3 encode_semantic_ids.py \\
       --checkpoint out/rqvae/All_Beauty/cross_modal/checkpoint_best.pt \\
       --embeddings outputs/embeddings/All_Beauty/text_embeddings.pt \\
       --asins      outputs/embeddings/All_Beauty/asins.json \\
       --data_dir   data/amazon_all_beauty \\
       --device     cuda
+
+  # Limited-modality
+  python3 encode_semantic_ids.py \\
+      --checkpoint        out/rqvae/All_Beauty/cross_modal_limited/checkpoint_best.pt \\
+      --text_embeddings   outputs/embeddings/All_Beauty/limited_text_embeddings.pt \\
+      --image_embeddings  outputs/embeddings/All_Beauty/limited_image_embeddings.pt \\
+      --asins             outputs/embeddings/All_Beauty/asins.json \\
+      --modality_mask_path data/limited_modality_mask.json \\
+      --out_dir           out/rqvae/All_Beauty/cross_modal_limited/ \\
+      --device            cuda
 """
 
 import argparse
@@ -167,12 +191,71 @@ def update_jsonl(filepath: str, asin_to_token: dict[str, str], dry_run: bool = F
 # Main
 # ---------------------------------------------------------------------------
 
+def build_composite_embeddings(
+    text_emb: torch.Tensor,
+    image_emb: torch.Tensor,
+    asins: list,
+    modality_mask: dict,
+) -> torch.Tensor:
+    """Build a per-item composite embedding for the limited-modality case.
+
+    Selection rule (consistent with apply_modality_mask_to_embeddings.py):
+      "both" / "text_only" items  → text_emb[i]   (text is present)
+      "image_only" items          → image_emb[i]   (text is zeroed out)
+
+    As a safety fallback, any item not found in the mask whose text row is
+    zero-norm also falls back to the image embedding.
+    """
+    composite = text_emb.clone()
+    asin_to_idx = {asin: i for i, asin in enumerate(asins)}
+
+    n_image_used = 0
+    for asin, status in modality_mask.items():
+        idx = asin_to_idx.get(asin)
+        if idx is None:
+            continue
+        if status == "image_only":
+            composite[idx] = image_emb[idx]
+            n_image_used += 1
+
+    # Fallback: any row still zero after mask lookup → use image embedding
+    zero_rows = composite.norm(dim=-1) < 1e-6
+    composite[zero_rows] = image_emb[zero_rows]
+    n_zero_fallback = zero_rows.sum().item() - n_image_used
+    if n_zero_fallback > 0:
+        print(f"  [composite] {n_zero_fallback} additional zero-text rows fell back to image embedding")
+
+    print(f"  [composite] image embedding used for {n_image_used:,} image_only items")
+    return composite
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate RQ-VAE semantic IDs for all items.")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to checkpoint_best.pt")
-    parser.add_argument("--embeddings", required=True,
-                        help="Path to text_embeddings.pt (N, D)")
+
+    # --- Embedding inputs (mutually exclusive modes) ---
+    emb_group = parser.add_argument_group(
+        "Embedding inputs",
+        "Use --embeddings for a standard single-tensor run, OR use "
+        "--text_embeddings + --image_embeddings + --modality_mask_path "
+        "for the limited-modality composite run."
+    )
+    emb_group.add_argument("--embeddings", default=None,
+                           help="Path to a single embedding tensor (N, D). "
+                                "Used for standard (full-modality) runs.")
+    emb_group.add_argument("--text_embeddings", default=None,
+                           help="Path to limited_text_embeddings.pt (N, D). "
+                                "Required for limited-modality runs.")
+    emb_group.add_argument("--image_embeddings", default=None,
+                           help="Path to limited_image_embeddings.pt (N, D). "
+                                "Required for limited-modality runs.")
+    emb_group.add_argument("--modality_mask_path", default=None,
+                           help="Path to limited_modality_mask.json. "
+                                "When provided, a per-item composite embedding is built: "
+                                "image_only items use image_embeddings[i], "
+                                "all others use text_embeddings[i].")
+
     parser.add_argument("--asins", required=True,
                         help="Path to asins.json — ordered list of parent_asin strings")
     parser.add_argument("--data_dir", default=None,
@@ -187,19 +270,45 @@ def main():
                         help="Parse and compute IDs but do not write any files.")
     args = parser.parse_args()
 
+    # Validate embedding argument combinations
+    if args.embeddings is not None and (
+        args.text_embeddings is not None or args.image_embeddings is not None
+    ):
+        parser.error("--embeddings cannot be combined with --text_embeddings / --image_embeddings")
+    if args.embeddings is None and args.text_embeddings is None:
+        parser.error("Provide either --embeddings (standard) or "
+                     "--text_embeddings + --image_embeddings (limited-modality)")
+    limited_mode = args.modality_mask_path is not None
+    if limited_mode and (args.text_embeddings is None or args.image_embeddings is None):
+        parser.error("--modality_mask_path requires both --text_embeddings and --image_embeddings")
+
     device = torch.device(args.device)
 
     # -- Load model --
     model = load_model(args.checkpoint, device)
 
     # -- Load embeddings & ASINs --
-    embeddings = torch.load(args.embeddings, map_location="cpu", weights_only=False).float()
     with open(args.asins) as f:
         asins = json.load(f)
 
-    assert len(asins) == len(embeddings), (
-        f"ASIN count ({len(asins)}) != embedding count ({len(embeddings)})"
-    )
+    if limited_mode:
+        print("Limited-modality mode: building composite embeddings ...")
+        text_emb  = torch.load(args.text_embeddings,  map_location="cpu", weights_only=False).float()
+        image_emb = torch.load(args.image_embeddings, map_location="cpu", weights_only=False).float()
+        assert len(asins) == len(text_emb) == len(image_emb), (
+            f"ASIN count ({len(asins)}) must match text ({len(text_emb)}) "
+            f"and image ({len(image_emb)}) embedding counts"
+        )
+        with open(args.modality_mask_path) as f:
+            modality_mask = json.load(f)
+        print(f"  Loaded modality mask with {len(modality_mask):,} entries")
+        embeddings = build_composite_embeddings(text_emb, image_emb, asins, modality_mask)
+    else:
+        embeddings = torch.load(args.embeddings, map_location="cpu", weights_only=False).float()
+        assert len(asins) == len(embeddings), (
+            f"ASIN count ({len(asins)}) != embedding count ({len(embeddings)})"
+        )
+
     print(f"Loaded {len(asins):,} items  (embedding dim={embeddings.shape[1]})")
 
     # -- Encode --

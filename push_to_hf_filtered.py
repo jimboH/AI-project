@@ -25,9 +25,15 @@ from pathlib import Path
 
 import pandas as pd
 from datasets import Dataset, DatasetDict, Features, Image, Sequence, Value
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, DatasetCard, DatasetCardData
 from PIL import Image as PILImage
 from tqdm import tqdm
+
+# Target size for images stored in the HF dataset (longest side, px).
+# 512 matches Unsloth's internal smart-resize default and gives 256 visual
+# tokens per image — a good balance of quality vs. training speed.
+# Set to 0 to disable resizing (stores native resolution, ~4 MB per image).
+UPLOAD_IMAGE_SIZE = 256
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -322,8 +328,23 @@ def items_generator(metadata: dict, semid_tokens: dict, semid_codes: dict):
         }
 
 
-SHARD_DIR  = Path("/mnt/storage/temp/items_shards")
 SHARD_SIZE = 2000  # items per shard
+
+
+def _resize_for_upload(img: PILImage.Image, target_size: int) -> PILImage.Image:
+    """Downscale img so its longest side == target_size, using BILINEAR.
+
+    Never upscales. Returns the original if target_size <= 0 or image is
+    already smaller than target_size on both sides.
+    """
+    if target_size <= 0:
+        return img
+    w, h = img.size
+    if max(w, h) <= target_size:
+        return img
+    scale = target_size / max(w, h)
+    return img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                      PILImage.BILINEAR)
 
 
 def build_and_push_items_sharded(
@@ -332,6 +353,7 @@ def build_and_push_items_sharded(
     semid_codes: dict,
     repo_id: str,
     token: str | None,
+    image_size: int = UPLOAD_IMAGE_SIZE,
 ):
     """Write Parquet shards locally and upload each one immediately.
 
@@ -343,11 +365,17 @@ def build_and_push_items_sharded(
     import pyarrow.parquet as pq
 
     api = HfApi(token=token)
+
+    # Version the shard directory by image size so re-runs with different
+    # sizes don't reuse stale shards from a previous upload.
+    size_tag = f"{image_size}px" if image_size > 0 else "native"
+    SHARD_DIR = Path(f"/mnt/storage/temp/items_shards_{size_tag}")
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
 
     asins = list(metadata.keys())
     n_shards = (len(asins) + SHARD_SIZE - 1) // SHARD_SIZE
     print(f"\nBuilding items config: {len(asins):,} items -> {n_shards} shards of {SHARD_SIZE}")
+    print(f"  Image resize: {size_tag} (longest side)")
 
     pa_schema = ITEMS_FEATURES.arrow_schema
 
@@ -363,16 +391,22 @@ def build_and_push_items_sharded(
                 {a: metadata[a] for a in batch_asins}, semid_tokens, semid_codes
             ))
 
-            # Convert PIL Images to bytes for pyarrow
+            # Convert PIL Images to bytes for pyarrow, resizing first.
+            # Resizing here (once, at upload time) means training workers
+            # never need to resize — they just decode the already-correct size.
             for row in rows:
                 for img_col in ("image_main", "image_pt01", "image_pt02"):
                     img = row[img_col]
                     if img is not None:
+                        img = _resize_for_upload(img, image_size)
                         buf = io.BytesIO()
-                        img.save(buf, format="JPEG")
+                        img.save(buf, format="JPEG", quality=90, optimize=True)
                         row[img_col] = {"bytes": buf.getvalue(), "path": None}
                     else:
-                        row[img_col] = {"bytes": None, "path": None}
+                        # Must be Python None (Arrow null), NOT {"bytes": None, "path": None}.
+                        # A non-null struct with both fields null is a valid Arrow value but
+                        # HF's image decoder rejects it with "both are None" ValueError.
+                        row[img_col] = None
 
             cols = {col: [r[col] for r in rows] for col in rows[0]}
 
@@ -403,6 +437,50 @@ def build_and_push_items_sharded(
 
 
 # ---------------------------------------------------------------------------
+# Step 4: Update dataset card so HF recognises both configs
+# ---------------------------------------------------------------------------
+
+def update_dataset_card(repo_id: str, token: str | None, n_shards: int):
+    """Patch the README.md YAML front-matter to declare both configs.
+
+    Only the `configs:` key is updated; every other field (dataset_info,
+    license, tags, …) is left intact.  Replacing the whole DatasetCardData
+    object (as done previously) wiped out the dataset_info block that
+    push_to_hub wrote for 'interactions', causing the datasets library to
+    fall back to raw file auto-detection and raise DataFilesNotFoundError.
+    """
+    both_configs = [
+        {
+            "config_name": "interactions",
+            # push_to_hub stores splits at {config_name}/{split}-*.parquet (no data/ prefix)
+            "data_files": [
+                {"split": "train", "path": "interactions/train-*.parquet"},
+                {"split": "valid", "path": "interactions/valid-*.parquet"},
+                {"split": "test",  "path": "interactions/test-*.parquet"},
+            ],
+        },
+        {
+            "config_name": "items",
+            # sharded upload via api.upload_file uses data/items/ prefix
+            "data_files": [
+                {"split": "train", "path": "data/items/items-*.parquet"},
+            ],
+        },
+    ]
+
+    try:
+        card = DatasetCard.load(repo_id, repo_type="dataset", token=token)
+        # Surgically update only the configs list; preserve dataset_info etc.
+        card.data.configs = both_configs
+    except Exception:
+        # Repo has no card yet — create a minimal one.
+        card = DatasetCard.from_template(DatasetCardData(configs=both_configs))
+
+    card.push_to_hub(repo_id, repo_type="dataset", token=token)
+    print("  Dataset card updated with both configs (interactions + items).")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -415,6 +493,12 @@ def main():
     parser.add_argument("--skip_interactions", action="store_true")
     parser.add_argument("--min_history",     type=int, default=MIN_HISTORY_LEN,
                         help=f"Minimum history length to keep a row (default: {MIN_HISTORY_LEN})")
+    parser.add_argument("--image_size",      type=int, default=UPLOAD_IMAGE_SIZE,
+                        help=(
+                            "Resize images to this px on the longest side before storing in Parquet. "
+                            "512 (default) = 256 visual tokens in Qwen3.5-VL, good training speed. "
+                            "0 = store native resolution (large files, slow training)."
+                        ))
     args = parser.parse_args()
 
     # --- Load shared resources ---
@@ -455,7 +539,13 @@ def main():
             metadata, semid_tokens, semid_codes,
             repo_id=REPO_ID,
             token=args.token,
+            image_size=args.image_size,
         )
+
+    # Always refresh the dataset card so both configs are visible to
+    # load_dataset(), regardless of which steps were skipped this run.
+    print("\nUpdating dataset card ...")
+    update_dataset_card(REPO_ID, token=args.token, n_shards=0)
 
     print("\nDone.")
 

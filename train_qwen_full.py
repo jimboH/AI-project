@@ -2,8 +2,28 @@ import argparse
 import os
 import time as _time
 import torch
+import torch._dynamo
 import wandb
 from datasets import load_dataset
+
+# ── torch.compile recompile-limit bump ────────────────────────────────────────
+# Unsloth compiles Qwen3_5RMSNorm_forward with fullgraph=True. That single
+# compiled code object is shared across every RMSNorm instance in the model
+# (input/post-attention layernorms plus q_norm/k_norm, which have a different
+# weight shape). Dynamo guards per instance/shape, so recompiles accumulate
+# fast. The torch default recompile_limit is only 8; once exceeded, fullgraph=True
+# forbids an eager fallback and hard-fails with:
+#   torch._dynamo.exc.FailOnRecompileLimitHit: Hard failure due to fullgraph=True
+# Unsloth normally bumps these to 1024, but set them here too so the limit holds
+# regardless of whether Unsloth's import-time patch ran. Re-applied after model
+# load (load_model_and_tokenizer) in case Unsloth's patching lowered them.
+def _bump_dynamo_recompile_limits():
+    torch._dynamo.config.recompile_limit = 1024
+    torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.accumulated_cache_size_limit = 4096
+
+
+_bump_dynamo_recompile_limits()
 
 # ── Spawn-safe import discipline ──────────────────────────────────────────────
 # Python's `spawn` multiprocessing start method re-executes this file in every
@@ -32,6 +52,7 @@ from data_utils import (
     PreTokenizingDataset,
     make_parallel_collate_fn,
     LazyTask1Dataset,
+    LazySemanticIdTask2Dataset,
     ListDataset,
     LazyTask2Dataset,
     build_semid_to_index,
@@ -89,9 +110,21 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Cap the number of history items used in the Task 2 image/multimodal prompt. "
+            "Cap the number of history items used in the Task 2 prompt. "
             "None = use all. Strongly recommended to set 3–5 for image mode to avoid "
-            "exceeding max_length. When capped, the most recent items are kept (tail of list)."
+            "exceeding max_length. When capped, the most recent items are kept (tail of list). "
+            "Also applied in text mode."
+        ),
+    )
+    parser.add_argument(
+        "--max_text_chars_per_item",
+        type=int,
+        default=512,
+        help=(
+            "Maximum characters per history item in text mode. "
+            "Each item's 'Title. Details' string is hard-clipped to this length before "
+            "being inserted into the prompt, preventing runaway sequence lengths when "
+            "product details fields are long. Default 512."
         ),
     )
     parser.add_argument(
@@ -169,7 +202,8 @@ def load_model_and_tokenizer(args):
     return model, tokenizer
 
 
-def prepare_task1_dataset(max_samples=None, image_size=224, dataset="theblackcat102/amazon-all-beauty-filtered"):
+def prepare_task1_dataset(max_samples=None, image_size=224, max_text_chars_per_item=512,
+                           dataset="theblackcat102/amazon-all-beauty-filtered"):
     items = load_dataset(
         dataset, "items", split="train"
     )
@@ -200,11 +234,12 @@ def prepare_task1_dataset(max_samples=None, image_size=224, dataset="theblackcat
     else:
         print("[Task 1] Images will be passed at native resolution (processor handles resizing)")
     # Return a lazy dataset — no images are decoded here.
-    return LazyTask1Dataset(items, image_size=image_size)
+    return LazyTask1Dataset(items, image_size=image_size, max_text_chars=max_text_chars_per_item)
 
 
 def prepare_task2_dataset(max_samples=None, historical_inputs="semantic_id",
                            image_size=0, max_history_items=None, max_images=None,
+                           max_text_chars_per_item=512,
                            dataset="theblackcat102/amazon-all-beauty-filtered"):
     interactions = load_dataset(
         dataset, "interactions", split="train"
@@ -217,21 +252,41 @@ def prepare_task2_dataset(max_samples=None, historical_inputs="semantic_id",
 
     # ── semantic_id mode ──────────────────────────────────────────────────────
     if historical_inputs == "semantic_id":
-        converted = []
-        for sample in interactions:
-            history_lines = "".join(
-                f"{i+1}.{sid}<|im_end|>\n"
-                for i, sid in enumerate(sample["history_semantic_ids"])
+        # Use a lazy dataset backed by the HF Arrow interactions table.
+        #
+        # Why lazy instead of ListDataset (eager)?
+        # -----------------------------------------
+        # The DataLoader uses multiprocessing_context="fork".  Under fork,
+        # Python's reference-counting turns every read of a pre-built Python
+        # list element into a copy-on-write page fault.  A ListDataset of 5 600
+        # prompt strings (some potentially >10 KB for power users) would cause
+        # all workers to COW-copy the entire list into their own address space,
+        # bloating RAM and stalling the prefetch queue.
+        #
+        # HF Arrow datasets use memory-mapped native buffers without Python GC
+        # overhead, so forked workers share the same physical pages and no COW
+        # faulting occurs.  Per-sample prompt construction (cheap string ops)
+        # happens inside the worker on demand.
+        #
+        # Why max_history_items matters here:
+        # ------------------------------------
+        # image/multimodal modes are auto-capped to ~1 history item by the
+        # compute_max_images() budget (1 native-res image already fills most of
+        # the 4 096-token budget).  semantic_id mode has NO equivalent cap unless
+        # max_history_items is set — users with 100–500 interactions produce
+        # huge prompt strings, making tokenisation in workers 10–100× slower
+        # than image mode and turning the DataLoader into the training bottleneck.
+        if max_history_items is None:
+            print(
+                "[Task 2][semantic_id] WARNING: max_history_items is not set. "
+                "Users with many interactions will produce very long prompts, "
+                "making per-sample tokenisation slow and stalling the DataLoader. "
+                "Pass --max_history_items (e.g. 20) to cap history length."
             )
-            prompt = (
-                f"User interaction history:\n{history_lines}"
-                "Predict the next item's semantic ID:"
-            )
-            converted.append({"messages": [
-                {"role": "user",      "content": [{"type": "text", "text": prompt}]},
-                {"role": "assistant", "content": [{"type": "text", "text": sample["target_semantic_id"]}]},
-            ]})
-        return ListDataset(converted)
+        return LazySemanticIdTask2Dataset(
+            interactions_hf_dataset=interactions,
+            max_history_items=max_history_items,
+        )
 
     # ── text mode ─────────────────────────────────────────────────────────────
     if historical_inputs == "text":
@@ -244,13 +299,18 @@ def prepare_task2_dataset(max_samples=None, historical_inputs="semantic_id",
 
         converted = []
         for sample in interactions:
+            history_sids = sample["history_semantic_ids"]
+            if max_history_items is not None:
+                history_sids = history_sids[-max_history_items:]
             history_entries = []
-            for sid in sample["history_semantic_ids"]:
+            for sid in history_sids:
                 text = semid_to_text.get(sid)
                 if text:
-                    history_entries.append(text)
+                    if max_text_chars_per_item is not None:
+                        text = text[:256]
+                    history_entries.append(text[:256])
             history_lines = "".join(
-                f"{i+1}.{text}<|im_end|>\n" for i, text in enumerate(history_entries)
+                f"{i+1}.{text}<|im_end|>\n" for i, text in enumerate(history_entries[-8:])
             )
             prompt = (
                 f"User interaction history:\n{history_lines}"
@@ -489,6 +549,10 @@ def main():
     # 1. Load model and tokenizer, add semantic tokens, resize embeddings
     model, tokenizer = load_model_and_tokenizer(args)
 
+    # Re-apply: Unsloth's import-time patching (triggered inside
+    # load_model_and_tokenizer) may have reset the dynamo recompile limits.
+    _bump_dynamo_recompile_limits()
+
     # 2. Prepare datasets for both tasks
     # Compute a safe image-per-sample cap for Task 2 image/multimodal modes.
     # This prevents the Qwen3-VL processor ValueError caused by truncation
@@ -505,13 +569,16 @@ def main():
     else:
         max_images = None
 
-    task1_data = prepare_task1_dataset(args.max_task1_samples, args.image_size, dataset=args.dataset)
+    task1_data = prepare_task1_dataset(args.max_task1_samples, args.image_size,
+                                        max_text_chars_per_item=args.max_text_chars_per_item,
+                                        dataset=args.dataset)
     task2_data = prepare_task2_dataset(
         args.max_task2_samples,
         args.historical_inputs,
         image_size=args.image_size,
         max_history_items=args.max_history_items,
         max_images=max_images,
+        max_text_chars_per_item=args.max_text_chars_per_item,
         dataset=args.dataset,
     )
 
