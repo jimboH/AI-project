@@ -159,6 +159,16 @@ def parse_args():
             "processor ValueError). Override only if you know your actual token budget."
         ),
     )
+    parser.add_argument(
+        "--task2_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Train on Task 2 (recsys interactions) only, skipping Task 1 (item indexing). "
+            "History items still use the format selected by --historical_inputs. "
+            "Uses a standard random sampler instead of HalfHalfBatchSampler."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -188,18 +198,37 @@ def load_model_and_tokenizer(args):
     print(f"Added {num_added} new tokens. New vocab size: {new_vocab_size}")
 
     # Resize embedding matrix
-    old_vocab_size = model.get_input_embeddings().weight.shape[0]
     model.resize_token_embeddings(new_vocab_size)
 
-    # Mean-init new rows for both input embeddings and LM head (output embeddings)
+    # ── New-row range ─────────────────────────────────────────────────────────
+    # resize_token_embeddings pads the matrix to the nearest multiple (e.g. 64),
+    # so weight.shape[0] > new_vocab_size after the call.  Using weight.shape[0]
+    # as the split point (the old code) would touch those padding rows too.
+    # Correct bounds: the actual new token positions are the last num_added rows
+    # of the true vocabulary, i.e. [new_vocab_size - num_added, new_vocab_size).
+    new_row_start = len(inner_tok) - num_added   # first real new-token row
+    new_row_end   = len(inner_tok)               # one past last real new-token row
+
+    # Mean-init new rows + noise to break symmetry.
+    # All 1 024 new rows would receive identical mean_emb without noise, making
+    # their gradients collapse to the same direction every step (the backward
+    # through an embedding lookup sums identical rows → identical gradient →
+    # identical updates).  Noise std 0.02 ≈ per-dimension std of existing rows.
     with torch.no_grad():
-        mean_emb = model.get_input_embeddings().weight[:old_vocab_size].mean(dim=0)
-        model.get_input_embeddings().weight[old_vocab_size:] = mean_emb
+        emb_w = model.get_input_embeddings().weight
+        mean_emb = emb_w[:new_row_start].mean(dim=0)
+        noise = torch.randn(new_row_end - new_row_start, emb_w.shape[1],
+                            dtype=emb_w.dtype, device=emb_w.device) * 0.02
+        emb_w[new_row_start:new_row_end] = mean_emb.unsqueeze(0) + noise
 
-        mean_lm = model.get_output_embeddings().weight[:old_vocab_size].mean(dim=0)
-        model.get_output_embeddings().weight[old_vocab_size:] = mean_lm
+        lm_w = model.get_output_embeddings().weight
+        mean_lm = lm_w[:new_row_start].mean(dim=0)
+        noise = torch.randn(new_row_end - new_row_start, lm_w.shape[1],
+                            dtype=lm_w.dtype, device=lm_w.device) * 0.02
+        lm_w[new_row_start:new_row_end] = mean_lm.unsqueeze(0) + noise
 
-    return model, tokenizer
+    print(f"New rows [{new_row_start}, {new_row_end}) initialised with mean+noise.")
+    return model, tokenizer, new_row_start
 
 
 def prepare_task1_dataset(max_samples=None, image_size=224, max_text_chars_per_item=512,
@@ -367,7 +396,7 @@ def prepare_task2_dataset(max_samples=None, historical_inputs="semantic_id",
 
 
 def build_trainer(model, tokenizer, dataset, args, task1_size: int = 0, task2_size: int = 0,
-                   processor_path: str | None = None):
+                   processor_path: str | None = None, new_emb_row_start: int | None = None):
     # Deferred imports — only the main process calls build_trainer(), so these
     # heavy packages are never imported by DataLoader workers.
     from unsloth import FastVisionModel  # triggers CUDA patching; main process only
@@ -375,6 +404,24 @@ def build_trainer(model, tokenizer, dataset, args, task1_size: int = 0, task2_si
     from trl import SFTConfig
 
     FastVisionModel.for_training(model)
+
+    # ── 10× gradient-scale hook for new token rows ────────────────────────────
+    # Registered AFTER for_training() so any Unsloth parameter surgery is done.
+    # Scaling the gradient by 10× gives the new rows an effective lr ≈ 1e-3 when
+    # the global lr is 1e-4, matching the recommended separate-param-group LR,
+    # without needing a custom optimizer.  Old rows are unaffected (scale = 1).
+    if new_emb_row_start is not None:
+        _start = new_emb_row_start
+
+        def _scale_new_rows(grad, start=_start, factor=10.0):
+            g = grad.clone()
+            g[start:] *= factor
+            return g
+
+        model.get_input_embeddings().weight.register_hook(_scale_new_rows)
+        model.get_output_embeddings().weight.register_hook(_scale_new_rows)
+        print(f"[Init] Gradient scale x10 registered for new rows [{_start}:] "
+              f"on input_embeddings and output_embeddings.")
 
     use_parallel = args.parallel_collate and args.dataloader_workers > 0
 
@@ -439,6 +486,7 @@ def build_trainer(model, tokenizer, dataset, args, task1_size: int = 0, task2_si
             optim="adamw_8bit",
             weight_decay=0.01,
             lr_scheduler_type="cosine",
+            max_grad_norm=10.0,            # default 1.0 clips 6-25× every step; 10.0 lets gradients breathe
             seed=3407,
             output_dir=args.output_dir,
             report_to="wandb",
@@ -530,12 +578,14 @@ def main():
     _hist_suffix = args.historical_inputs
     if args.max_history_items is not None:
         _hist_suffix += f"x{args.max_history_items}"
+    _tasks_suffix = "t2only" if args.task2_only else "t1t2"
     run_name = args.wandb_run_name or (
         f"qwen_full"
         f"_hist={_hist_suffix}"
+        f"_{_tasks_suffix}"
         f"_steps={args.max_steps}"
-        f"_t1={args.max_task1_samples or 'all'}"
-        f"_t2={args.max_task2_samples or 'all'}"
+        + (f"_t1={args.max_task1_samples or 'all'}" if not args.task2_only else "")
+        + f"_t2={args.max_task2_samples or 'all'}"
     )
     wandb_id, is_wandb_resume = get_or_create_wandb_id(args.output_dir, checkpoint_path is not None)
     wandb.init(
@@ -547,7 +597,7 @@ def main():
     )
 
     # 1. Load model and tokenizer, add semantic tokens, resize embeddings
-    model, tokenizer = load_model_and_tokenizer(args)
+    model, tokenizer, new_row_start = load_model_and_tokenizer(args)
 
     # Re-apply: Unsloth's import-time patching (triggered inside
     # load_model_and_tokenizer) may have reset the dynamo recompile limits.
@@ -569,9 +619,6 @@ def main():
     else:
         max_images = None
 
-    task1_data = prepare_task1_dataset(args.max_task1_samples, args.image_size,
-                                        max_text_chars_per_item=args.max_text_chars_per_item,
-                                        dataset=args.dataset)
     task2_data = prepare_task2_dataset(
         args.max_task2_samples,
         args.historical_inputs,
@@ -582,11 +629,22 @@ def main():
         dataset=args.dataset,
     )
 
-    # 3. Joint training: ConcatDataset keeps both lazy datasets intact
-    combined = torch.utils.data.ConcatDataset([task1_data, task2_data])
-    print(f"Task 1 samples : {len(task1_data)}")
-    print(f"Task 2 samples : {len(task2_data)}")
-    print(f"Total combined : {len(combined)}")
+    if args.task2_only:
+        combined = task2_data
+        task1_size = 0
+        task2_size = len(task2_data)
+        print(f"Task 2 only : {task2_size} samples")
+    else:
+        # 3. Joint training: ConcatDataset keeps both lazy datasets intact
+        task1_data = prepare_task1_dataset(args.max_task1_samples, args.image_size,
+                                            max_text_chars_per_item=args.max_text_chars_per_item,
+                                            dataset=args.dataset)
+        combined = torch.utils.data.ConcatDataset([task1_data, task2_data])
+        task1_size = len(task1_data)
+        task2_size = len(task2_data)
+        print(f"Task 1 samples : {task1_size}")
+        print(f"Task 2 samples : {task2_size}")
+        print(f"Total combined : {len(combined)}")
 
     # 4. Build trainer and run
     # ── Save processor so spawned DataLoader workers can reload it from disk ──
@@ -600,9 +658,10 @@ def main():
     print(f"[DataLoader] Processor saved for workers: {_proc_tmp_dir}")
 
     trainer = build_trainer(model, tokenizer, combined, args,
-                            task1_size=len(task1_data),
-                            task2_size=len(task2_data),
-                            processor_path=_proc_tmp_dir)
+                            task1_size=task1_size,
+                            task2_size=task2_size,
+                            processor_path=_proc_tmp_dir,
+                            new_emb_row_start=new_row_start)
     trainer.train(resume_from_checkpoint=checkpoint_path)
 
     # 5. Save full weights + tokenizer (includes new special tokens)
