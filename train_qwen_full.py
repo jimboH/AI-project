@@ -55,6 +55,7 @@ from data_utils import (
     LazySemanticIdTask2Dataset,
     ListDataset,
     LazyTask2Dataset,
+    LazyMultiModeTask2Dataset,
     build_semid_to_index,
     build_semid_to_text,
     build_semid_to_index_and_text,
@@ -96,13 +97,22 @@ def parse_args():
         "--historical_inputs",
         type=str,
         default="semantic_id",
-        choices=["semantic_id", "text", "image", "multimodal"],
         help=(
-            "What feature to use for history items in the Task 2 decoder prompt.\n"
-            "  semantic_id  — raw semantic token string (current default behaviour)\n"
+            "Comma-separated list of history representations for Task 2 samples.\n"
+            "Valid values: semantic_id, text, image, multimodal\n"
+            "\n"
+            "Single mode (original behaviour):\n"
+            "  --historical_inputs image\n"
+            "\n"
+            "Multi-mode (new): each interaction is repeated once per mode, making\n"
+            "the Task 2 dataset N× larger. Every copy predicts the same target\n"
+            "semantic ID but sees a different history representation:\n"
+            "  --historical_inputs image,text,multimodal\n"
+            "\n"
+            "  semantic_id  — raw semantic token string for each history item\n"
             "  text         — product title + details looked up from the items dataset\n"
             "  image        — product image thumbnail for each history item\n"
-            "  multimodal   — (future) image + text for each history item"
+            "  multimodal   — image(s) + text for each history item"
         ),
     )
     parser.add_argument(
@@ -170,6 +180,31 @@ def parse_args():
         ),
     )
     return parser.parse_args()
+
+
+_VALID_HIST_MODES = {"semantic_id", "text", "image", "multimodal"}
+
+
+def parse_historical_inputs(value: str) -> list:
+    """Parse and validate the ``--historical_inputs`` argument.
+
+    Accepts a single mode name or a comma-separated list of mode names.
+    Returns a deduplicated ordered list, preserving the user-specified order.
+
+    Raises ``ValueError`` if any mode is unknown.
+    """
+    modes = [m.strip() for m in value.split(",") if m.strip()]
+    if not modes:
+        raise ValueError("--historical_inputs must specify at least one mode.")
+    # Deduplicate while preserving order (dict trick, Python 3.7+)
+    modes = list(dict.fromkeys(modes))
+    invalid = set(modes) - _VALID_HIST_MODES
+    if invalid:
+        raise ValueError(
+            f"--historical_inputs: unknown mode(s) {sorted(invalid)}. "
+            f"Valid: {sorted(_VALID_HIST_MODES)}"
+        )
+    return modes
 
 
 def build_semantic_tokens():
@@ -279,120 +314,187 @@ def prepare_task2_dataset(max_samples=None, historical_inputs="semantic_id",
     else:
         print(f"[Task 2] Using all {len(interactions)} samples")
 
-    # ── semantic_id mode ──────────────────────────────────────────────────────
-    if historical_inputs == "semantic_id":
-        # Use a lazy dataset backed by the HF Arrow interactions table.
-        #
-        # Why lazy instead of ListDataset (eager)?
-        # -----------------------------------------
-        # The DataLoader uses multiprocessing_context="fork".  Under fork,
-        # Python's reference-counting turns every read of a pre-built Python
-        # list element into a copy-on-write page fault.  A ListDataset of 5 600
-        # prompt strings (some potentially >10 KB for power users) would cause
-        # all workers to COW-copy the entire list into their own address space,
-        # bloating RAM and stalling the prefetch queue.
-        #
-        # HF Arrow datasets use memory-mapped native buffers without Python GC
-        # overhead, so forked workers share the same physical pages and no COW
-        # faulting occurs.  Per-sample prompt construction (cheap string ops)
-        # happens inside the worker on demand.
-        #
-        # Why max_history_items matters here:
-        # ------------------------------------
-        # image/multimodal modes are auto-capped to ~1 history item by the
-        # compute_max_images() budget (1 native-res image already fills most of
-        # the 4 096-token budget).  semantic_id mode has NO equivalent cap unless
-        # max_history_items is set — users with 100–500 interactions produce
-        # huge prompt strings, making tokenisation in workers 10–100× slower
-        # than image mode and turning the DataLoader into the training bottleneck.
-        if max_history_items is None:
-            print(
-                "[Task 2][semantic_id] WARNING: max_history_items is not set. "
-                "Users with many interactions will produce very long prompts, "
-                "making per-sample tokenisation slow and stalling the DataLoader. "
-                "Pass --max_history_items (e.g. 20) to cap history length."
-            )
-        return LazySemanticIdTask2Dataset(
-            interactions_hf_dataset=interactions,
-            max_history_items=max_history_items,
-        )
+    # Parse mode list (supports both "image" and "image,text,multimodal")
+    modes = parse_historical_inputs(historical_inputs)
 
-    # ── text mode ─────────────────────────────────────────────────────────────
-    if historical_inputs == "text":
-        print("[Task 2] Loading items dataset to build semantic-ID → text lookup …")
-        items = load_dataset(
-            dataset, "items", split="train"
-        )
-        semid_to_text = build_semid_to_text(items)
-        print(f"[Task 2] Lookup built: {len(semid_to_text)} entries")
+    # ── Single-mode fast paths (unchanged legacy behaviour) ───────────────────
+    if len(modes) == 1:
+        mode = modes[0]
 
-        converted = []
-        for sample in interactions:
-            history_sids = sample["history_semantic_ids"]
-            if max_history_items is not None:
-                history_sids = history_sids[-max_history_items:]
-            history_entries = []
-            for sid in history_sids:
-                text = semid_to_text.get(sid)
-                if text:
-                    if max_text_chars_per_item is not None:
-                        text = text[:256]
-                    history_entries.append(text[:256])
-            history_lines = "".join(
-                f"{i+1}.{text}<|im_end|>\n" for i, text in enumerate(history_entries[-8:])
+        # ── semantic_id ───────────────────────────────────────────────────────
+        if mode == "semantic_id":
+            # Use a lazy dataset backed by the HF Arrow interactions table.
+            #
+            # Why lazy instead of ListDataset (eager)?
+            # -----------------------------------------
+            # The DataLoader uses multiprocessing_context="fork".  Under fork,
+            # Python's reference-counting turns every read of a pre-built Python
+            # list element into a copy-on-write page fault.  A ListDataset of 5 600
+            # prompt strings (some potentially >10 KB for power users) would cause
+            # all workers to COW-copy the entire list into their own address space,
+            # bloating RAM and stalling the prefetch queue.
+            #
+            # HF Arrow datasets use memory-mapped native buffers without Python GC
+            # overhead, so forked workers share the same physical pages and no COW
+            # faulting occurs.  Per-sample prompt construction (cheap string ops)
+            # happens inside the worker on demand.
+            #
+            # Why max_history_items matters here:
+            # ------------------------------------
+            # image/multimodal modes are auto-capped to ~1 history item by the
+            # compute_max_images() budget (1 native-res image already fills most of
+            # the 4 096-token budget).  semantic_id mode has NO equivalent cap unless
+            # max_history_items is set — users with 100–500 interactions produce
+            # huge prompt strings, making tokenisation in workers 10–100× slower
+            # than image mode and turning the DataLoader into the training bottleneck.
+            if max_history_items is None:
+                print(
+                    "[Task 2][semantic_id] WARNING: max_history_items is not set. "
+                    "Users with many interactions will produce very long prompts, "
+                    "making per-sample tokenisation slow and stalling the DataLoader. "
+                    "Pass --max_history_items (e.g. 20) to cap history length."
+                )
+            return LazySemanticIdTask2Dataset(
+                interactions_hf_dataset=interactions,
+                max_history_items=max_history_items,
             )
-            prompt = (
-                f"User interaction history:\n{history_lines}"
-                "Predict the next item's semantic ID:"
-            )
-            converted.append({"messages": [
-                {"role": "user",      "content": [{"type": "text", "text": prompt}]},
-                {"role": "assistant", "content": [{"type": "text", "text": sample["target_semantic_id"]}]},
-            ]})
-        return ListDataset(converted)
 
-    # ── image / multimodal modes ───────────────────────────────────────────────
-    if historical_inputs in ("image", "multimodal"):
-        print(f"[Task 2] Loading items dataset to build semantic-ID → image index …")
-        items = load_dataset(
-            dataset, "items", split="train"
-        )
-        if historical_inputs == "multimodal":
-            # Single-pass: builds both index and text map in one 112K-row scan.
-            # 1.57× faster than two separate calls (saves ~6s startup at 112K rows).
+        # ── text ──────────────────────────────────────────────────────────────
+        if mode == "text":
+            print("[Task 2] Loading items dataset to build semantic-ID → text lookup …")
+            items = load_dataset(
+                dataset, "items", split="train"
+            )
+            semid_to_text = build_semid_to_text(items)
+            print(f"[Task 2] Lookup built: {len(semid_to_text)} entries")
+
+            converted = []
+            for sample in interactions:
+                history_sids = sample["history_semantic_ids"]
+                if max_history_items is not None:
+                    history_sids = history_sids[-max_history_items:]
+                history_entries = []
+                for sid in history_sids:
+                    text = semid_to_text.get(sid)
+                    if text:
+                        if max_text_chars_per_item is not None:
+                            text = text[:max_text_chars_per_item]
+                        history_entries.append(text)
+                history_lines = "".join(
+                    f"{i+1}.{text}<|im_end|>\n" for i, text in enumerate(history_entries)
+                )
+                prompt = (
+                    f"User interaction history:\n{history_lines}"
+                    "Predict the next item's semantic ID:"
+                )
+                converted.append({"messages": [
+                    {"role": "user",      "content": [{"type": "text", "text": prompt}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": sample["target_semantic_id"]}]},
+                ]})
+            return ListDataset(converted)
+
+        # ── image / multimodal ────────────────────────────────────────────────
+        if mode in ("image", "multimodal"):
+            print(f"[Task 2] Loading items dataset to build semantic-ID → image index …")
+            items = load_dataset(
+                dataset, "items", split="train"
+            )
+            if mode == "multimodal":
+                # Single-pass: builds both index and text map in one 112K-row scan.
+                # 1.57× faster than two separate calls (saves ~6s startup at 112K rows).
+                semid_to_index, semid_to_text = build_semid_to_index_and_text(items)
+                print(f"[Task 2] Image index + text map built in one pass: "
+                      f"{len(semid_to_index)} image entries, {len(semid_to_text)} text entries")
+            else:
+                semid_to_index = build_semid_to_index(items)
+                print(f"[Task 2] Image index built: {len(semid_to_index)} entries with image_main")
+                semid_to_text = None
+
+            # Project items down to only the columns LazyTask2Dataset actually needs.
+            # Benchmarks show full-row random access costs 1.95ms vs 0.69ms with
+            # projection — a 2.8x speedup per history item lookup.
+            # image mode   : only image_main is rendered per history item
+            # multimodal   : all three image views + title + details
+            if mode == "image":
+                items = items.select_columns(["semantic_id", "image_main"])
+            else:  # multimodal
+                items = items.select_columns(
+                    ["semantic_id", "image_main", "image_pt01", "image_pt02", "title", "details"]
+                )
+            print(f"[Task 2] Items projected to {items.column_names} — {len(items)} rows")
+
+            return LazyTask2Dataset(
+                interactions_hf_dataset=interactions,
+                items_hf_dataset=items,
+                semid_to_index=semid_to_index,
+                semid_to_text=semid_to_text,
+                mode=mode,
+                image_size=image_size,
+                max_history_items=max_history_items,
+                max_images=max_images,
+            )
+
+    # ── Multi-mode path ───────────────────────────────────────────────────────
+    # Each base interaction produces len(modes) training samples; all share the
+    # same target semantic ID but use a different history representation.
+    # Total dataset size = len(interactions) × len(modes).
+    print(
+        f"[Task 2] Multi-mode active: {modes} — "
+        f"each of {len(interactions)} interactions → {len(modes)} samples "
+        f"(total {len(interactions) * len(modes)})"
+    )
+
+    need_text  = any(m in ("text",  "multimodal") for m in modes)
+    need_image = any(m in ("image", "multimodal") for m in modes)
+
+    semid_to_text  = None
+    semid_to_index = None
+    items          = None
+
+    if need_text or need_image:
+        print("[Task 2] Loading items dataset for multi-mode lookup …")
+        items = load_dataset(dataset, "items", split="train")
+
+        if need_text and need_image:
+            # Single-pass builds both maps — avoids scanning 112K rows twice.
             semid_to_index, semid_to_text = build_semid_to_index_and_text(items)
-            print(f"[Task 2] Image index + text map built in one pass: "
-                  f"{len(semid_to_index)} image entries, {len(semid_to_text)} text entries")
-        else:
-            semid_to_index = build_semid_to_index(items)
-            print(f"[Task 2] Image index built: {len(semid_to_index)} entries with image_main")
-            semid_to_text = None
-
-        # Project items down to only the columns LazyTask2Dataset actually needs.
-        # Benchmarks show full-row random access costs 1.95ms vs 0.69ms with
-        # projection — a 2.8x speedup per history item lookup.
-        # image mode   : only image_main is rendered per history item
-        # multimodal   : all three image views + title + details
-        if historical_inputs == "image":
-            items = items.select_columns(["semantic_id", "image_main"])
-        else:  # multimodal
-            items = items.select_columns(
-                ["semantic_id", "image_main", "image_pt01", "image_pt02", "title", "details"]
+            print(
+                f"[Task 2] Image index + text map built in one pass: "
+                f"{len(semid_to_index)} image entries, {len(semid_to_text)} text entries"
             )
+        elif need_text:
+            semid_to_text = build_semid_to_text(items)
+            print(f"[Task 2] Text map built: {len(semid_to_text)} entries")
+        else:  # only image
+            semid_to_index = build_semid_to_index(items)
+            print(f"[Task 2] Image index built: {len(semid_to_index)} entries")
+
+        # Project items to only the columns needed across the active modes.
+        # Full-row random access costs ~1.95ms vs ~0.69ms with projection (2.8×).
+        cols = ["semantic_id"]
+        if need_image:
+            cols.append("image_main")
+            if any(m == "multimodal" for m in modes):
+                cols += ["image_pt01", "image_pt02"]
+        if need_text:
+            cols += ["title", "details"]
+        # Deduplicate while preserving order (dict trick, Python 3.7+).
+        seen: set = set()
+        cols = [c for c in cols if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
+        items = items.select_columns(cols)
         print(f"[Task 2] Items projected to {items.column_names} — {len(items)} rows")
 
-        return LazyTask2Dataset(
-            interactions_hf_dataset=interactions,
-            items_hf_dataset=items,
-            semid_to_index=semid_to_index,
-            semid_to_text=semid_to_text,
-            mode=historical_inputs,
-            image_size=image_size,
-            max_history_items=max_history_items,
-            max_images=max_images,
-        )
-
-    raise ValueError(f"Unknown historical_inputs value: '{historical_inputs}'")
+    return LazyMultiModeTask2Dataset(
+        interactions_hf_dataset=interactions,
+        items_hf_dataset=items,
+        modes=modes,
+        semid_to_index=semid_to_index,
+        semid_to_text=semid_to_text,
+        image_size=image_size,
+        max_history_items=max_history_items,
+        max_images=max_images,
+        max_text_chars=max_text_chars_per_item,
+    )
 
 
 def build_trainer(model, tokenizer, dataset, args, task1_size: int = 0, task2_size: int = 0,
@@ -571,11 +673,16 @@ def main():
 
     args = parse_args()
 
+    # Validate --historical_inputs early so the user gets a clear error before
+    # any model or dataset loading begins.
+    hist_modes = parse_historical_inputs(args.historical_inputs)
+
     # 0. Resolve checkpoint (None → fresh run)
     checkpoint_path = resolve_checkpoint(args.resume_from_checkpoint, args.output_dir)
 
     # 0. Initialise W&B — same project used by the rest of this repo
-    _hist_suffix = args.historical_inputs
+    # Use "+" as separator in run names for multi-mode (commas break some shells)
+    _hist_suffix = "+".join(hist_modes)
     if args.max_history_items is not None:
         _hist_suffix += f"x{args.max_history_items}"
     _tasks_suffix = "t2only" if args.task2_only else "t1t2"
@@ -609,7 +716,7 @@ def main():
     # slicing through a visual-token sequence mid-image.
     if args.max_images_per_sample is not None:
         max_images = args.max_images_per_sample
-    elif args.historical_inputs in ("image", "multimodal"):
+    elif any(m in ("image", "multimodal") for m in hist_modes):
         max_images = compute_max_images(args.max_length, args.image_size)
         print(
             f"[Task 2] Auto-derived max_images_per_sample={max_images} "

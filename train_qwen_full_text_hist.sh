@@ -5,6 +5,9 @@
 #   bash train_qwen_full_text_hist.sh
 #   MAX_STEPS=1000 bash train_qwen_full_text_hist.sh
 #   bash train_qwen_full_text_hist.sh --max_steps 1000 --output_dir outputs/qwen_text_v2
+#
+# Multi-mode (each interaction → N samples, one per mode):
+#   HISTORICAL_INPUTS=text,image,multimodal bash train_qwen_full_text_hist.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,35 +26,51 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/qwen_full_text_hist}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 IMAGE_SIZE="${IMAGE_SIZE:-0}"
 MODEL_NAME="${MODEL_NAME:-unsloth/Qwen3.5-0.8B}"
+# Default to text-only; override with e.g. HISTORICAL_INPUTS=text,image,multimodal
+HISTORICAL_INPUTS="${HISTORICAL_INPUTS:-text}"
 WANDB_PROJECT="${WANDB_PROJECT:-gen-retrieval-decoder}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_${MAX_STEPS}steps_texthist}"
+# Replace commas with "+" so the run name is shell/URL-safe in multi-mode.
+HIST_DISPLAY="${HISTORICAL_INPUTS//,/+}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_${MAX_STEPS}steps_hist=${HIST_DISPLAY}}"
 DATALOADER_WORKERS="${DATALOADER_WORKERS:-4}"
+
+# Apply history cap when any text/semantic_id mode is active (no built-in
+# image-budget guard for those modes).
+MAX_HISTORY_ITEMS="${MAX_HISTORY_ITEMS:-}"
+if [[ -z "$MAX_HISTORY_ITEMS" ]]; then
+    if [[ "$HISTORICAL_INPUTS" == *"text"* || "$HISTORICAL_INPUTS" == *"semantic_id"* ]]; then
+        MAX_HISTORY_ITEMS=20
+    fi
+fi
 
 MAX_TASK1="${MAX_TASK1:-}"
 MAX_TASK2="${MAX_TASK2:-}"
 
 EXTRA_ARGS=()
-[[ -n "$MAX_TASK1" ]] && EXTRA_ARGS+=(--max_task1_samples "$MAX_TASK1")
-[[ -n "$MAX_TASK2" ]] && EXTRA_ARGS+=(--max_task2_samples "$MAX_TASK2")
+[[ -n "$MAX_TASK1"         ]] && EXTRA_ARGS+=(--max_task1_samples  "$MAX_TASK1")
+[[ -n "$MAX_TASK2"         ]] && EXTRA_ARGS+=(--max_task2_samples  "$MAX_TASK2")
+[[ -n "$MAX_HISTORY_ITEMS" ]] && EXTRA_ARGS+=(--max_history_items  "$MAX_HISTORY_ITEMS")
 EXTRA_ARGS+=("$@")
 
 echo "============================================================"
 echo " Qwen3.5-0.8B full-weight finetuning  [text history]"
 echo "============================================================"
-echo "  model           : $MODEL_NAME"
-echo "  historical_inputs: text"
-echo "  max_steps       : $MAX_STEPS"
-echo "  lr              : $LR"
-echo "  batch_size      : $BATCH_SIZE"
-echo "  grad_accum      : $GRAD_ACCUM  (effective bs = $((BATCH_SIZE * GRAD_ACCUM)))"
-echo "  warmup_steps    : $WARMUP_STEPS"
-echo "  output_dir      : $OUTPUT_DIR"
-echo "  image_size      : $IMAGE_SIZE"
-echo "  dl workers      : $DATALOADER_WORKERS"
-echo "  wandb project   : $WANDB_PROJECT"
-echo "  wandb run       : $WANDB_RUN_NAME"
-[[ -n "$MAX_TASK1" ]] && echo "  task1 cap       : $MAX_TASK1 samples"
-[[ -n "$MAX_TASK2" ]] && echo "  task2 cap       : $MAX_TASK2 samples"
+echo "  model            : $MODEL_NAME"
+echo "  historical_inputs: $HISTORICAL_INPUTS"
+[[ "$HISTORICAL_INPUTS" != "$HIST_DISPLAY" ]] && echo "  hist_display     : $HIST_DISPLAY  (commas → + in run name)" || true
+echo "  max_steps        : $MAX_STEPS"
+echo "  lr               : $LR"
+echo "  batch_size       : $BATCH_SIZE"
+echo "  grad_accum       : $GRAD_ACCUM  (effective bs = $((BATCH_SIZE * GRAD_ACCUM)))"
+echo "  warmup_steps     : $WARMUP_STEPS"
+echo "  output_dir       : $OUTPUT_DIR"
+echo "  image_size       : $IMAGE_SIZE"
+[[ -n "$MAX_HISTORY_ITEMS" ]] && echo "  max_hist_items   : $MAX_HISTORY_ITEMS" || true
+echo "  dl workers       : $DATALOADER_WORKERS"
+echo "  wandb project    : $WANDB_PROJECT"
+echo "  wandb run        : $WANDB_RUN_NAME"
+[[ -n "$MAX_TASK1" ]] && echo "  task1 cap        : $MAX_TASK1 samples" || true
+[[ -n "$MAX_TASK2" ]] && echo "  task2 cap        : $MAX_TASK2 samples" || true
 echo "============================================================"
 echo ""
 
@@ -60,7 +79,7 @@ free -h
 echo ""
 
 python train_qwen_full.py \
-    --historical_inputs  text \
+    --historical_inputs  "$HISTORICAL_INPUTS" \
     --max_steps          "$MAX_STEPS" \
     --lr                 "$LR" \
     --batch_size         "$BATCH_SIZE" \

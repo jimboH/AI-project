@@ -2,9 +2,14 @@
 # train_qwen_full.sh — full-weight Qwen3.5-0.8B finetuning
 # W&B project : gen-retrieval-decoder  (same as the rest of this repo)
 # Usage:
-#   bash train_qwen_full.sh               # full run (500 steps, all data)
+#   bash train_qwen_full.sh                                    # full run (500 steps, all data)
 #   bash train_qwen_full.sh --max_steps 2000 --output_dir outputs/qwen_v2
-#   MAX_STEPS=50 bash train_qwen_full.sh  # override via env var
+#   MAX_STEPS=50 bash train_qwen_full.sh                       # override via env var
+#
+# Multi-mode history (each interaction → N samples, one per mode):
+#   HISTORICAL_INPUTS=image,text,multimodal bash train_qwen_full.sh
+#   HISTORICAL_INPUTS=image,text            bash train_qwen_full.sh
+# Commas in HISTORICAL_INPUTS are converted to "+" in the W&B run name.
 set -euo pipefail
 
 # ── Resolve script directory so the script works from any CWD ────────────────
@@ -35,14 +40,18 @@ HISTORICAL_INPUTS="${HISTORICAL_INPUTS:-semantic_id}"
 #   20 items × ~8 tokens/item ≈ 160 extra tokens — well within a 4 096 budget.
 # - image / multimodal: compute_max_images() enforces its own hard cap via
 #   max_images; MAX_HISTORY_ITEMS here just adds an additional coarser guard.
+# Multi-mode: if *any* of the comma-separated modes is semantic_id or text,
+# apply the cap — the image budget guard only covers image/multimodal slots.
 if [[ -z "${MAX_HISTORY_ITEMS:-}" ]]; then
-    if [[ "$HISTORICAL_INPUTS" == "semantic_id" || "$HISTORICAL_INPUTS" == "text" ]]; then
+    if [[ "$HISTORICAL_INPUTS" == *"semantic_id"* || "$HISTORICAL_INPUTS" == *"text"* ]]; then
         MAX_HISTORY_ITEMS=20
     fi
 fi
 MAX_HISTORY_ITEMS="${MAX_HISTORY_ITEMS:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-gen-retrieval-decoder}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_hist=${HISTORICAL_INPUTS}_${MAX_STEPS}steps}"
+# Replace commas with "+" so the run name is shell/URL-safe in multi-mode.
+HIST_DISPLAY="${HISTORICAL_INPUTS//,/+}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-qwen_full_hist=${HIST_DISPLAY}_${MAX_STEPS}steps}"
 # Each worker forks the parent process (~1.7 GB RAM inherited per worker).
 # With persistent_workers=True all workers spawn at DataLoader creation and
 # immediately fill the prefetch queue.
@@ -77,6 +86,7 @@ echo "  warmup_steps : $WARMUP_STEPS"
 echo "  output_dir   : $OUTPUT_DIR"
 echo "  image_size   : $IMAGE_SIZE"
 echo "  hist_inputs  : $HISTORICAL_INPUTS"
+[[ "$HISTORICAL_INPUTS" != "$HIST_DISPLAY" ]] && echo "  hist_display : $HIST_DISPLAY  (commas → + in run name)" || true
 [[ -n "$MAX_HISTORY_ITEMS" ]] && echo "  max_hist_items: $MAX_HISTORY_ITEMS"
 echo "  dl workers   : $DATALOADER_WORKERS"
 echo "  wandb project: $WANDB_PROJECT"

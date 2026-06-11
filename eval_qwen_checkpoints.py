@@ -319,25 +319,69 @@ def _extract_images(messages: list[dict]) -> list[Image.Image]:
     return imgs
 
 
+def _strip_oldest_history_item(messages: list[dict]) -> bool:
+    """Remove the oldest (first) history item from the message content in-place.
+
+    Content layout produced by build_visual_messages:
+      [0] header text  "User interaction history:\\n"
+      [1..k] oldest item: number-text + image(s) + optional text + "<|im_end|>\\n" text
+      [k+1..] remaining items ...
+      [-1] footer text "Predict the next item's semantic ID:"
+
+    Returns True if an item was removed, False if the history is already empty.
+    """
+    content = messages[0]["content"]
+    for i in range(1, len(content)):
+        block = content[i]
+        if block.get("type") == "text" and "<|im_end|>" in block.get("text", ""):
+            del content[1 : i + 1]
+            return True
+    return False
+
+
 def _encode_single(processor, messages: list[dict], max_length: int) -> dict:
-    """Encode one multimodal sample with apply_chat_template + processor.
+    """Encode one multimodal sample, truncating by dropping oldest history items
+    before falling back to hard token-level truncation.
+
+    Dropping whole items avoids cutting mid-image-token-span, which would cause
+    the model's RoPE index calculation to see a shape mismatch at generation time.
 
     Returns a dict of tensors with the batch dimension squeezed out so samples
     can be left-padded and stacked by _pad_and_stack().
     """
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    images = _extract_images(messages)
-    kwargs: dict = dict(
-        text=text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-    )
-    if images:
-        kwargs["images"] = images
-    enc = processor(**kwargs)
+    while True:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        images = _extract_images(messages)
+        kwargs: dict = dict(text=text, return_tensors="pt")
+        if images:
+            kwargs["images"] = images
+        enc = processor(**kwargs)
+
+        if enc["input_ids"].shape[1] <= max_length:
+            break  # fits within budget
+
+        if not _strip_oldest_history_item(messages):
+            break  # no history left to drop; fall through to hard truncation
+
+    # Hard-truncation fallback: only reached when even zero history items still
+    # exceed max_length (e.g. a single enormous image or very long footer text).
+    if enc["input_ids"].shape[1] > max_length:
+        enc["input_ids"] = enc["input_ids"][:, :max_length]
+        enc["attention_mask"] = enc["attention_mask"][:, :max_length]
+        if "mm_token_type_ids" in enc:
+            enc["mm_token_type_ids"] = enc["mm_token_type_ids"][:, :max_length]
+        if "image_grid_thw" in enc:
+            vision_start_id = processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+            n_images_kept = int((enc["input_ids"][0] == vision_start_id).sum().item())
+            thw = enc["image_grid_thw"]
+            if n_images_kept < thw.shape[0]:
+                tokens_per_img = (thw[:, 0] * thw[:, 1] * thw[:, 2]).tolist()
+                keep_pv_rows = int(sum(tokens_per_img[:n_images_kept]))
+                enc["pixel_values"]   = enc["pixel_values"][:keep_pv_rows]
+                enc["image_grid_thw"] = thw[:n_images_kept]
+
     # squeeze the batch dim the processor always adds
     out = {
         "input_ids":      enc["input_ids"].squeeze(0),

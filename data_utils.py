@@ -671,6 +671,226 @@ class LazyTask2Dataset(torch.utils.data.Dataset):
         ]}
 
 
+class LazyMultiModeTask2Dataset(torch.utils.data.Dataset):
+    """Task 2 dataset that expands each interaction into N samples — one per mode.
+
+    When multiple ``historical_inputs`` modes are requested (e.g. ``"image,text,multimodal"``),
+    each original interaction produces N training samples that all predict the **same**
+    target semantic ID but differ in how the history is represented:
+
+    * ``semantic_id`` — raw semantic token string for every history item
+    * ``text``        — title + details text for every history item
+    * ``image``       — image thumbnail for every history item
+    * ``multimodal``  — image(s) + text for every history item
+
+    Layout
+    ------
+    Total length = ``len(interactions) × n_modes``.
+    Index ``i`` maps to:
+      * mode        = ``modes[i % n_modes]``
+      * interaction = ``interactions[i // n_modes]``
+
+    Interleaving like this means the trainer sees all N representations of each
+    interaction in rapid succession, which helps the model learn modality-invariant
+    item embeddings while sharing the same target supervision signal.
+
+    Parameters
+    ----------
+    interactions_hf_dataset:
+        HF Dataset for the ``interactions`` config split.
+    items_hf_dataset:
+        HF Dataset for the ``items`` config split, already projected to the
+        columns needed by the active modes.  ``None`` when only ``semantic_id``
+        mode is active (no items are needed).
+    modes:
+        Ordered list of active mode strings.
+    semid_to_index:
+        ``{semantic_id: row_index}`` into ``items_hf_dataset`` for items that
+        have ``image_main``.  Required when any mode is ``"image"`` or
+        ``"multimodal"``; otherwise ``None``.
+    semid_to_text:
+        ``{semantic_id: "Title. Details"}`` lookup.  Required when any mode is
+        ``"text"`` or ``"multimodal"``; otherwise ``None``.
+    image_size:
+        Square resize target (pixels).  0 = skip resize.
+    max_history_items:
+        Cap on history items per sample; most-recent kept.  ``None`` = no cap.
+    max_images:
+        Hard cap on total images per sample (image / multimodal modes).
+        ``None`` = no cap.
+    max_text_chars:
+        Max characters per history item text string before insertion into the
+        prompt.  ``None`` = no cap.
+    """
+
+    def __init__(
+        self,
+        interactions_hf_dataset,
+        items_hf_dataset,
+        modes: list,
+        semid_to_index: dict | None,
+        semid_to_text: dict | None,
+        image_size: int = 0,
+        max_history_items=None,
+        max_images=None,
+        max_text_chars: int | None = 512,
+    ):
+        self.interactions      = interactions_hf_dataset
+        self.items             = items_hf_dataset
+        self.modes             = modes
+        self.n_modes           = len(modes)
+        self.semid_to_idx      = semid_to_index or {}
+        self.semid_to_text     = semid_to_text or {}
+        self.image_size        = image_size
+        self.max_history_items = max_history_items
+        self.max_images        = max_images
+        self.max_text_chars    = max_text_chars
+        # Per-worker in-process LRU-style cache for popular item rows.
+        self._img_cache: dict = {}
+        self._img_cache_maxsize = 512
+
+    # ── Item cache ─────────────────────────────────────────────────────────────
+
+    def _fetch_item(self, item_idx: int) -> dict:
+        """Return item row from cache or HF Arrow, evicting oldest when full."""
+        if item_idx not in self._img_cache:
+            if len(self._img_cache) >= self._img_cache_maxsize:
+                self._img_cache.pop(next(iter(self._img_cache)))
+            self._img_cache[item_idx] = self.items[item_idx]
+        return self._img_cache[item_idx]
+
+    # ── Dataset protocol ───────────────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self.interactions) * self.n_modes
+
+    def __getitem__(self, idx: int) -> dict:
+        mode            = self.modes[idx % self.n_modes]
+        interaction_idx = idx // self.n_modes
+        interaction     = self.interactions[interaction_idx]
+        target_sid      = interaction["target_semantic_id"]
+        history_sids    = interaction["history_semantic_ids"]
+
+        if self.max_history_items is not None:
+            history_sids = history_sids[-self.max_history_items:]
+
+        return {"messages": self._build_messages(mode, history_sids, target_sid)}
+
+    # ── Per-mode prompt builders ───────────────────────────────────────────────
+
+    def _build_messages(self, mode: str, history_sids: list, target_sid: str) -> list:
+        if mode == "semantic_id":
+            return self._build_semid(history_sids, target_sid)
+        if mode == "text":
+            return self._build_text(history_sids, target_sid)
+        if mode == "image":
+            return self._build_image(history_sids, target_sid)
+        if mode == "multimodal":
+            return self._build_multimodal(history_sids, target_sid)
+        raise ValueError(f"LazyMultiModeTask2Dataset: unknown mode '{mode}'")
+
+    def _assistant(self, target_sid: str) -> dict:
+        return {"role": "assistant", "content": [{"type": "text", "text": target_sid}]}
+
+    def _build_semid(self, history_sids: list, target_sid: str) -> list:
+        history_lines = "".join(
+            f"{i + 1}.{sid}<|im_end|>\n"
+            for i, sid in enumerate(history_sids)
+        )
+        prompt = (
+            f"User interaction history:\n{history_lines}"
+            "Predict the next item's semantic ID:"
+        )
+        return [
+            {"role": "user",      "content": [{"type": "text", "text": prompt}]},
+            self._assistant(target_sid),
+        ]
+
+    def _build_text(self, history_sids: list, target_sid: str) -> list:
+        history_entries = []
+        for sid in history_sids:
+            text = self.semid_to_text.get(sid)
+            if text:
+                if self.max_text_chars is not None:
+                    text = text[:self.max_text_chars]
+                history_entries.append(text)
+        history_lines = "".join(
+            f"{i + 1}.{text}<|im_end|>\n"
+            for i, text in enumerate(history_entries)
+        )
+        prompt = (
+            f"User interaction history:\n{history_lines}"
+            "Predict the next item's semantic ID:"
+        )
+        return [
+            {"role": "user",      "content": [{"type": "text", "text": prompt}]},
+            self._assistant(target_sid),
+        ]
+
+    def _build_image(self, history_sids: list, target_sid: str) -> list:
+        content     = [{"type": "text", "text": "User interaction history:\n"}]
+        count       = 0
+        image_count = 0
+        for sid in history_sids:
+            if self.max_images is not None and image_count >= self.max_images:
+                break
+            item_idx = self.semid_to_idx.get(sid)
+            if item_idx is None:
+                continue
+            item = self._fetch_item(item_idx)
+            img  = item.get("image_main")
+            if img is None:
+                continue
+            if self.max_images is not None and image_count + 1 > self.max_images:
+                continue
+            count += 1
+            content.append({"type": "text",  "text": f"{count}."})
+            content.append({"type": "image", "image": resize_image(img, self.image_size)})
+            image_count += 1
+            content.append({"type": "text",  "text": "<|im_end|>\n"})
+        content.append({"type": "text", "text": "Predict the next item's semantic ID:"})
+        return [
+            {"role": "user",      "content": content},
+            self._assistant(target_sid),
+        ]
+
+    def _build_multimodal(self, history_sids: list, target_sid: str) -> list:
+        content     = [{"type": "text", "text": "User interaction history:\n"}]
+        count       = 0
+        image_count = 0
+        for sid in history_sids:
+            if self.max_images is not None and image_count >= self.max_images:
+                break
+            item_idx = self.semid_to_idx.get(sid)
+            if item_idx is None:
+                continue
+            item = self._fetch_item(item_idx)
+            incoming = sum(
+                1 for k in ("image_main", "image_pt01", "image_pt02")
+                if item.get(k) is not None
+            )
+            if self.max_images is not None and image_count + incoming > self.max_images:
+                continue
+            count += 1
+            content.append({"type": "text", "text": f"{count}."})
+            for key in ("image_main", "image_pt01", "image_pt02"):
+                img = item.get(key)
+                if img is not None:
+                    content.append({"type": "image", "image": resize_image(img, self.image_size)})
+                    image_count += 1
+            text = self.semid_to_text.get(sid, "")
+            if text:
+                if self.max_text_chars is not None:
+                    text = text[:self.max_text_chars]
+                content.append({"type": "text", "text": f" {text}"})
+            content.append({"type": "text", "text": "<|im_end|>\n"})
+        content.append({"type": "text", "text": "Predict the next item's semantic ID:"})
+        return [
+            {"role": "user",      "content": content},
+            self._assistant(target_sid),
+        ]
+
+
 def build_semid_to_index(items_hf_dataset) -> dict:
     """Return {semantic_id_string: row_index} for items that have image_main.
 
